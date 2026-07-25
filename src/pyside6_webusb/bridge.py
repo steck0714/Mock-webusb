@@ -24,6 +24,7 @@ or manually::
     # at DocumentCreation time. See polyfill.install() for the full wiring.
 """
 import json
+import time
 
 from PySide6.QtCore import QObject, Signal, Slot, QTimer, QSettings
 
@@ -37,6 +38,7 @@ from .hardening import (
     is_protected_interface_class,
     is_stall_error,
     protected_class_name,
+    safe_error_str,
 )
 from .chooser_dialog import WebUsbDeviceChooserDialog
 
@@ -201,10 +203,18 @@ class WebUSBBridge(QObject):
         return info.get("device")
 
     def _on_page_navigated(self, *_args):
-        """別オリジンへ遷移した瞬間、開いていたUSBハンドルを破棄する。"""
+        """別オリジンへ遷移した瞬間、開いていたUSBハンドルを破棄する。
+        ★ current(遷移先のオリジン)がNone(=判定不能。about:blank等)の場合は、
+        「安全にどのハンドルも維持できる根拠がない」とみなし、個別のorigin比較に
+        頼らず全ハンドルを破棄する(念のための安全側強化。理論上は_grant()が
+        falsyなoriginへの許可を発行しないためinfo["origin"]がNoneになることは
+        無いはずだが、比較ロジックだけに依存しない形にしておく)。"""
         try:
             current = self._current_origin()
-            stale_ids = [hid for hid, info in self._open_devices.items() if info.get("origin") != current]
+            if current is None:
+                stale_ids = list(self._open_devices.keys())
+            else:
+                stale_ids = [hid for hid, info in self._open_devices.items() if info.get("origin") != current]
             for hid in stale_ids:
                 info = self._open_devices.pop(hid, None)
                 if info and info.get("device") is not None:
@@ -325,7 +335,7 @@ class WebUSBBridge(QObject):
             usb_core.find()  # バックエンド疎通確認（デバイスの有無は問わない）
             return json.dumps({"available": True})
         except Exception as e:
-            return json.dumps({"available": False, "error": str(e)})
+            return json.dumps({"available": False, "error": safe_error_str(e)})
 
     @Slot(result=str)
     def listDevices(self):
@@ -373,19 +383,70 @@ class WebUSBBridge(QObject):
                 })
             return json.dumps({"devices": devices})
         except Exception as e:
-            return json.dumps({"devices": [], "error": str(e)})
+            return json.dumps({"devices": [], "error": safe_error_str(e)})
 
     @Slot(str, result=str)
+    def _enumerate_filtered_devices(self, usb_core, usb_util, filters, exclusion_filters):
+        """列挙 + ブロックリスト除外 + filters/exclusionFiltersでの絞り込みを行い、
+        チューザー表示用の軽量デバイス記述子のリストを返す。requestDeviceChooser()の
+        初回一覧構築と、ダイアログのライブ更新(refresh_callback)の両方から使う
+        共通ロジック。"""
+        raw_devices = list(usb_core.find(find_all=True))
+        devices_info = []
+        for dev in raw_devices:
+            # 🛡️ 既知のセキュリティキー等はチューザーダイアログの選択肢にすら出さない
+            #    (Chromium実装と同様の挙動。ユーザーが誤って許可してしまう余地を無くす)
+            if device_is_fully_blocked(dev):
+                continue
+            # 🛡️ WebUSB仕様どおり、options.filters/exclusionFiltersに一致しない
+            #    デバイスはチューザーの候補から除外する。
+            if not device_matches_any_usb_filter(dev, usb_util, filters):
+                continue
+            if exclusion_filters and device_matches_any_usb_filter(dev, usb_util, exclusion_filters):
+                continue
+            try:
+                devices_info.append(build_device_descriptor(dev, usb_util, include_configurations=False))
+                continue
+            except Exception as e:
+                print(f"[pyside6-webusb] _enumerate_filtered_devices(rich descriptor): 例外を無視: {e}")
+            manufacturer = product = None
+            try:
+                if dev.iManufacturer: manufacturer = usb_util.get_string(dev, dev.iManufacturer)
+                if dev.iProduct: product = usb_util.get_string(dev, dev.iProduct)
+            except Exception as e:
+                print(f"[pyside6-webusb] _enumerate_filtered_devices: 例外を無視: {e}")
+            devices_info.append({
+                "vendorId": dev.idVendor, "productId": dev.idProduct,
+                "manufacturerName": manufacturer, "productName": product,
+                "deviceClass": dev.bDeviceClass,
+            })
+
+        # 既知デバイス（過去に接続実績あり）を優先順位/最終接続日時順に並べ替える
+        try:
+            known = self._load_known_devices()
+            known_map = {(d.get("vendorId"), d.get("productId")): d for d in known}
+            def _sort_key(dev):
+                k = known_map.get((dev["vendorId"], dev["productId"]))
+                if k is None:
+                    return (1, 0, 0)  # 未知デバイスは後ろへ
+                return (0, -(k.get("connectCount", 0)), -(k.get("lastConnected", 0)))
+            devices_info.sort(key=_sort_key)
+        except Exception as e:
+            print(f"[pyside6-webusb] _enumerate_filtered_devices: 例外を無視: {e}")  # 並べ替えに失敗しても一覧表示自体は継続する
+        return devices_info
+
     def requestDeviceChooser(self, options_json):
         """navigator.usb.requestDevice() 相当。実デバイス選択ダイアログを表示し、
         ユーザーが明示的に選んだ場合のみデバイス情報を返す（WebUSB本来のセキュリティ設計を踏襲）。
         ★ メソッド全体を try/except で包み、ダイアログ表示中の例外でアプリが落ちないようにしている。
-        ★ v6.5 追加: options.filters/exclusionFiltersによる絞り込み(WebUSB仕様
+        ★ options.filters/exclusionFiltersによる絞り込み(WebUSB仕様
         「requestDevice(options)」のenumerate〜絞り込み手順を再現)。filters自体の
         必須チェック・各フィルタの妥当性検証("is a valid filter")はJS側
         (WEBUSB_POLYFILL_JS)で完了させた上でここへ渡す設計なので、ここでは
         構造的に妥当なfilters/exclusionFiltersが来る前提で一致判定だけを行う。
-        filtersが空リストの場合は仕様どおり「一致するデバイスなし」となる。"""
+        filtersが空リストの場合は仕様どおり「一致するデバイスなし」となる。
+        ★ Chromeの実際のチューザーを参考に、(1)要求元オリジンを明示、
+        (2)ダイアログを開いたままの接続/切断でライブ更新、を行う。"""
         try:
             try:
                 options = json.loads(options_json) if options_json else {}
@@ -401,52 +462,20 @@ class WebUSBBridge(QObject):
 
             try:
                 usb_core, usb_util = self._pyusb()
-                raw_devices = list(usb_core.find(find_all=True))
             except Exception as e:
-                return json.dumps({"cancelled": True, "error": str(e)})
+                return json.dumps({"cancelled": True, "error": safe_error_str(e)})
 
-            devices_info = []
-            for dev in raw_devices:
-                # 🛡️ 既知のセキュリティキー等はチューザーダイアログの選択肢にすら出さない
-                #    (Chromium実装と同様の挙動。ユーザーが誤って許可してしまう余地を無くす)
-                if device_is_fully_blocked(dev):
-                    continue
-                # 🛡️ WebUSB仕様どおり、options.filters/exclusionFiltersに一致しない
-                #    デバイスはチューザーの候補から除外する(旧実装はoptionsを一切
-                #    見ておらず、常に全デバイスを表示していた)。
-                if not device_matches_any_usb_filter(dev, usb_util, filters):
-                    continue
-                if exclusion_filters and device_matches_any_usb_filter(dev, usb_util, exclusion_filters):
-                    continue
-                try:
-                    devices_info.append(build_device_descriptor(dev, usb_util, include_configurations=False))
-                    continue
-                except Exception as e:
-                    print(f"[pyside6-webusb] requestDeviceChooser(rich descriptor): 例外を無視: {e}")
-                manufacturer = product = None
-                try:
-                    if dev.iManufacturer: manufacturer = usb_util.get_string(dev, dev.iManufacturer)
-                    if dev.iProduct: product = usb_util.get_string(dev, dev.iProduct)
-                except Exception as e:
-                    print(f"[pyside6-webusb] requestDeviceChooser: 例外を無視: {e}")
-                devices_info.append({
-                    "vendorId": dev.idVendor, "productId": dev.idProduct,
-                    "manufacturerName": manufacturer, "productName": product,
-                    "deviceClass": dev.bDeviceClass,
-                })
-
-            # 既知デバイス（過去に接続実績あり）を優先順位/最終接続日時順に並べ替える
             try:
-                known = self._load_known_devices()
-                known_map = {(d.get("vendorId"), d.get("productId")): d for d in known}
-                def _sort_key(dev):
-                    k = known_map.get((dev["vendorId"], dev["productId"]))
-                    if k is None:
-                        return (1, 0, 0)  # 未知デバイスは後ろへ
-                    return (0, -(k.get("connectCount", 0)), -(k.get("lastConnected", 0)))
-                devices_info.sort(key=_sort_key)
+                devices_info = self._enumerate_filtered_devices(usb_core, usb_util, filters, exclusion_filters)
             except Exception as e:
-                print(f"[pyside6-webusb] requestDeviceChooser: 例外を無視: {e}")  # 並べ替えに失敗しても一覧表示自体は継続する
+                return json.dumps({"cancelled": True, "error": safe_error_str(e)})
+
+            def _refresh():
+                # 🛡️ ダイアログが開いている間、新しく挿された/抜かれたデバイスを
+                #    反映する(Chromeのチューザーと同じ挙動)。再度pyusbから
+                #    取り直す必要があるため、ここでも_pyusb()を呼び直す。
+                u_core, u_util = self._pyusb()
+                return self._enumerate_filtered_devices(u_core, u_util, filters, exclusion_filters)
 
             parent = None
             try:
@@ -457,7 +486,11 @@ class WebUSBBridge(QObject):
                 parent = None
 
             try:
-                dlg = WebUsbDeviceChooserDialog(devices_info, parent)
+                dlg = WebUsbDeviceChooserDialog(
+                    devices_info, parent,
+                    origin=self._current_origin(),
+                    refresh_callback=_refresh,
+                )
                 result = dlg.exec()
                 accepted = (result == WebUsbDeviceChooserDialog.DialogCode.Accepted)
                 selected = dlg.selected_device if accepted else None
@@ -517,7 +550,7 @@ class WebUSBBridge(QObject):
             self._open_devices[handle_id] = {"device": dev, "origin": origin, "claimed_interfaces": set()}
             return json.dumps({"success": True, "handle": handle_id})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int)
     def closeDevice(self, handle_id):
@@ -569,7 +602,7 @@ class WebUSBBridge(QObject):
                 info.setdefault("claimed_interfaces", set()).add(interface_number)
             return json.dumps({"success": True})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, int, result=str)
     def releaseInterface(self, handle_id, interface_number):
@@ -587,7 +620,7 @@ class WebUSBBridge(QObject):
                 info.get("claimed_interfaces", set()).discard(interface_number)
             return json.dumps({"success": True})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, int, result=str)
     def selectConfiguration(self, handle_id, configuration_value):
@@ -601,7 +634,7 @@ class WebUSBBridge(QObject):
             dev.set_configuration(configuration_value)
             return json.dumps({"success": True})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, int, int, result=str)
     def selectAlternateInterface(self, handle_id, interface_number, alternate_setting):
@@ -620,7 +653,7 @@ class WebUSBBridge(QObject):
             dev.set_interface_altsetting(interface=interface_number, alternate_setting=alternate_setting)
             return json.dumps({"success": True})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, result=str)
     def resetDevice(self, handle_id):
@@ -632,7 +665,7 @@ class WebUSBBridge(QObject):
             dev.reset()
             return json.dumps({"success": True})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, str, int, result=str)
     def clearHalt(self, handle_id, direction, endpoint_number):
@@ -647,7 +680,7 @@ class WebUSBBridge(QObject):
             dev.clear_halt(address)
             return json.dumps({"success": True})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, int, int, result=str)
     def bulkTransferIn(self, handle_id, endpoint, length):
@@ -667,7 +700,7 @@ class WebUSBBridge(QObject):
                 raise
             return json.dumps({"success": True, "status": "ok", "data": bytes(data).hex()})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, int, str, result=str)
     def bulkTransferOut(self, handle_id, endpoint, data_hex):
@@ -683,7 +716,7 @@ class WebUSBBridge(QObject):
                 raise
             return json.dumps({"success": True, "status": "ok", "bytesWritten": written})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, int, int, int, int, int, result=str)
     def controlTransferIn(self, handle_id, request_type, request, value, index, length):
@@ -699,7 +732,7 @@ class WebUSBBridge(QObject):
                 raise
             return json.dumps({"success": True, "status": "ok", "data": bytes(data).hex()})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, int, int, int, int, str, result=str)
     def controlTransferOut(self, handle_id, request_type, request, value, index, data_hex):
@@ -715,7 +748,7 @@ class WebUSBBridge(QObject):
                 raise
             return json.dumps({"success": True, "status": "ok", "bytesWritten": written})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(result=str)
     def listKnownDevices(self):
@@ -725,7 +758,7 @@ class WebUSBBridge(QObject):
             devices.sort(key=lambda d: (-(d.get("connectCount", 0)), -(d.get("lastConnected", 0))))
             return json.dumps({"devices": devices})
         except Exception as e:
-            return json.dumps({"devices": [], "error": str(e)})
+            return json.dumps({"devices": [], "error": safe_error_str(e)})
 
     @Slot(int, int, result=str)
     def forgetKnownDevice(self, vendor_id, product_id):
@@ -737,7 +770,7 @@ class WebUSBBridge(QObject):
             self._save_known_devices(new_devices)
             return json.dumps({"success": True})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(result=str)
     def forgetAllKnownDevices(self):
@@ -746,7 +779,7 @@ class WebUSBBridge(QObject):
             self._save_known_devices([])
             return json.dumps({"success": True})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     # --- isochronous転送: 明示的に非対応とする ---
     # WebUSB仕様には存在するが、OS横断で確実に動くisochronous実装は難易度が高く、
@@ -779,7 +812,7 @@ class WebUSBBridge(QObject):
                 self._save_granted_origins(data)
             return json.dumps({"success": True})
         except Exception as e:
-            return json.dumps({"success": False, "error": str(e)})
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     # ↓↓↓ 以下3つは意図的に @Slot を付けていない(=QWebChannel経由でJS/Webページからは
     # 一切呼び出せない)。任意のオリジン一覧の閲覧・他オリジンの許可取り消しは、
@@ -788,23 +821,37 @@ class WebUSBBridge(QObject):
     # Python側で直接呼び出す想定。
     def list_granted_origins(self):
         """{origin: [{"vendorId":.., "productId":.., "grantedAt":..}, ...]}"""
-        return self._load_granted_origins()
+        try:
+            return self._load_granted_origins()
+        except Exception as e:
+            print(f"[pyside6-webusb] list_granted_origins: 例外を無視: {e}")
+            return {}
 
     def revoke_origin_grant(self, origin, vendor_id, product_id):
-        data = self._load_granted_origins()
-        grants = data.get(origin, [])
-        new_grants = [g for g in grants if not (g.get("vendorId") == vendor_id and g.get("productId") == product_id)]
-        if len(new_grants) != len(grants):
-            data[origin] = new_grants
-            self._save_granted_origins(data)
-            return True
-        return False
+        try:
+            data = self._load_granted_origins()
+            grants = data.get(origin, [])
+            new_grants = [g for g in grants if not (g.get("vendorId") == vendor_id and g.get("productId") == product_id)]
+            if len(new_grants) != len(grants):
+                data[origin] = new_grants
+                self._save_granted_origins(data)
+                return True
+            return False
+        except Exception as e:
+            # 🛡️ 呼び出し元(設定パネル等)が「取り消しに成功したか」を正しく判断できるよう、
+            #    保存失敗時にTrueを誤って返さない。
+            print(f"[pyside6-webusb] revoke_origin_grant: 例外を無視: {e}")
+            return False
 
     def revoke_all_for_origin(self, origin):
-        data = self._load_granted_origins()
-        if origin in data:
-            del data[origin]
-            self._save_granted_origins(data)
-            return True
-        return False
+        try:
+            data = self._load_granted_origins()
+            if origin in data:
+                del data[origin]
+                self._save_granted_origins(data)
+                return True
+            return False
+        except Exception as e:
+            print(f"[pyside6-webusb] revoke_all_for_origin: 例外を無視: {e}")
+            return False
 

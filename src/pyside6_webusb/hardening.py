@@ -487,3 +487,26 @@ def is_stall_error(exc) -> bool:
         return "pipe error" in msg or "stall" in msg
     except Exception:
         return False
+
+
+# ============================================================
+# 8) JSへ返すエラーメッセージの無害化
+# ============================================================
+# pyusb/libusb由来の例外メッセージをそのままJSON化してJS側へ渡していたが、
+# バックエンド・OSによっては改行やタブを含むメッセージを返すことがあり、
+# 極端に長いメッセージが返る可能性もゼロではない。JSON自体はこれらの文字を
+# 正しくエスケープするので壊れはしないが、JS側でのログ表示崩れや、
+# 万一の下流ログインジェクションを避けるための保険として正規化する。
+def safe_error_str(exc, max_len: int = 500) -> str:
+    """例外を、制御文字を含まない・長さの上限が保証された文字列に変換する。
+    "SecurityError:"のような、こちら側で明示的に付けている振り分け用の
+    接頭辞(文字列リテラルとして自前で組み立てているもので、str(exc)の
+    生の出力ではない)には影響しない。"""
+    try:
+        msg = str(exc)
+    except Exception:
+        return "unknown error"
+    msg = msg.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    if len(msg) > max_len:
+        msg = msg[:max_len] + "…"
+    return msg

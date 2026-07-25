@@ -96,9 +96,13 @@ class FakeChooserDialog:
 
     SELECT_INDEX = 0
     last_devices_info = None  # ダイアログへ実際に渡された(=絞り込み後の)一覧を記録しておく
+    last_origin = None
+    last_refresh_callback = None
 
-    def __init__(self, devices_info, parent, strings=None):
+    def __init__(self, devices_info, parent, strings=None, origin=None, refresh_callback=None):
         FakeChooserDialog.last_devices_info = devices_info
+        FakeChooserDialog.last_origin = origin
+        FakeChooserDialog.last_refresh_callback = refresh_callback
         self.devices_info = devices_info
         idx = FakeChooserDialog.SELECT_INDEX
         self.selected_device = devices_info[idx] if (idx is not None and idx < len(devices_info)) else None
@@ -196,6 +200,73 @@ def test_settings_fallback_uses_constructor_organization_and_application():
     print("test_settings_fallback_uses_constructor_organization_and_application: OK")
 
 
+def test_origin_is_passed_to_the_dialog(monkeypatch):
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [])])
+    bridge = make_bridge([dev_a])
+    monkeypatch.setattr("pyside6_webusb.bridge.WebUsbDeviceChooserDialog", FakeChooserDialog)
+    FakeChooserDialog.SELECT_INDEX = 0
+    bridge.requestDeviceChooser(json.dumps({"filters": [{}]}))
+    assert FakeChooserDialog.last_origin == "https://example.test"
+    print("test_origin_is_passed_to_the_dialog: OK")
+
+
+def test_refresh_callback_reflects_newly_plugged_device(monkeypatch):
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [])])
+    bridge = make_bridge([dev_a])
+    monkeypatch.setattr("pyside6_webusb.bridge.WebUsbDeviceChooserDialog", FakeChooserDialog)
+    FakeChooserDialog.SELECT_INDEX = 0
+    bridge.requestDeviceChooser(json.dumps({"filters": [{}]}))
+    assert len(FakeChooserDialog.last_refresh_callback()) == 1
+
+    # ダイアログを開いたまま新しいデバイスが挿された、という状況を模擬する
+    dev_b = FakeDevice(0x1234, 0x0002, [FakeConfiguration(1, [])])
+    bridge._pyusb = lambda: (FakeUsbCore([dev_a, dev_b]), FakeUsbUtil())
+    refreshed = FakeChooserDialog.last_refresh_callback()
+    assert len(refreshed) == 2
+    print("test_refresh_callback_reflects_newly_plugged_device: OK")
+
+
+def test_full_flow_persists_grant_and_usage_without_mocking_internals(monkeypatch, tmp_path=None):
+    """_grant()/_record_device_usage()を(テストのために上書きせず)実際に動かして
+    最後まで通す。この2つはtime.time()を使っており、以前 bridge.py に
+    `import time` が無いまま出荷され、実行時にNameErrorで静かに失敗していた
+    (呼び出し側がtry/exceptで包んでいたため、ダイアログの選択自体は成功する
+    ように見えてしまい、許可・利用実績の永続化だけがこっそり失敗していた)。
+    filters/exclusionFiltersのテストのようにこれらを丸ごとモックしていると
+    この種の欠陥を検出できないため、実装をそのまま通す専用のテストを分けている。
+    QSettingsは実システムの設定ストアを汚さないよう、一時ファイルのIniFormatへ
+    明示的に切り替える。"""
+    import tempfile
+    from PySide6.QtCore import QSettings
+
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [])])
+    bridge = WebUSBBridge()  # _grant/_record_device_usageは上書きしない(実装をそのまま使う)
+    bridge._pyusb = lambda: (FakeUsbCore([dev_a]), FakeUsbUtil())
+    bridge._current_origin = lambda: "https://example.test"
+
+    tmp_dir = str(tmp_path) if tmp_path is not None else tempfile.mkdtemp(prefix="pyside6_webusb_test_")
+    ini_path = os.path.join(tmp_dir, "settings.ini")
+    real_settings = QSettings(ini_path, QSettings.Format.IniFormat)
+    bridge._known_device_settings = lambda: real_settings
+
+    monkeypatch.setattr("pyside6_webusb.bridge.WebUsbDeviceChooserDialog", FakeChooserDialog)
+    FakeChooserDialog.SELECT_INDEX = 0
+    raw = bridge.requestDeviceChooser(json.dumps({"filters": [{}]}))
+    result = json.loads(raw)
+    assert result["cancelled"] is False
+    assert result["device"]["vendorId"] == 0x2341
+
+    granted = bridge.list_granted_origins()
+    assert granted.get("https://example.test"), "実際のQSettingsへ許可が永続化されているはず"
+    entry = granted["https://example.test"][0]
+    assert entry["vendorId"] == 0x2341 and entry["productId"] == 0x8036
+    assert isinstance(entry.get("grantedAt"), (int, float)), "grantedAtにtime.time()の値が入っているはず"
+
+    known = bridge._load_known_devices()
+    assert any(d.get("vendorId") == 0x2341 for d in known), "利用実績(known devices)にも記録されているはず"
+    print("test_full_flow_persists_grant_and_usage_without_mocking_internals: OK")
+
+
 if __name__ == "__main__":
     class _FakeMonkeypatch:
         """pytestなしでも走らせられるよう、monkeypatch.setattr相当を素朴に実装したもの。"""
@@ -212,4 +283,7 @@ if __name__ == "__main__":
     test_selected_device_gets_rich_descriptor(mp)
     test_grant_recorded_only_on_selection(mp)
     test_settings_fallback_uses_constructor_organization_and_application()
+    test_origin_is_passed_to_the_dialog(mp)
+    test_refresh_callback_reflects_newly_plugged_device(mp)
+    test_full_flow_persists_grant_and_usage_without_mocking_internals(mp)
     print("ALL BRIDGE TESTS PASSED")
