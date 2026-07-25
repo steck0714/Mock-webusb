@@ -12,4 +12,6 @@ $env:QTWEBENGINE_REMOTE_DEBUGGING = "9222"
 python examples/minimal_browser.py
 
 (Since the F12 feature is not enabled by default, please make sure to include $env:QTWEBENGINE_REMOTE_DEBUGGING = "9222" if you need to use the F12 functionality.）
+
+However, please be aware that this configuration might not work out of the box. It is recommended to personally implement the required F12 execution logic within the minimal_browser.py file
 <img width="1920" height="1174" alt="OpenWeb v6 3 5 2026_07_25 16_17_18" src="https://github.com/user-attachments/assets/aaba8afa-f892-405d-ae46-db6e579907f5" />
