@@ -3,6 +3,7 @@ An AI-generated mock implementation of WebUSB API for PySide.
 (Screenshot of the F12 console during testing.)
 
 To run minimal_browser.py from this release on Windows, use this PowerShell command:
+
 $env:PYTHONPATH = "src"
 python examples/minimal_browser.py
 
