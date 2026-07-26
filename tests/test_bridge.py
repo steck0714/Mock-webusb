@@ -9,6 +9,14 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+# ★ `pytest`経由ならconftest.pyが同じ処理を先に行うが、`python tests/test_bridge.py`と
+# 直接実行した場合はconftest.pyが自動では読み込まれないため、ここでも同じ
+# ヘッドレス環境向けオフスクリーン自動フォールバックを行う(理由はconftest.py参照。
+# QApplication([])のディスプレイ接続失敗はPythonの例外ではなくプロセスクラッシュに
+# なるため、try/exceptでは救えず、生成前に検知して回避する必要がある)。
+if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
 from PySide6.QtWidgets import QApplication
 
 from pyside6_webusb.bridge import WebUSBBridge
