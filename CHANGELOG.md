@@ -42,6 +42,18 @@ value) surfaced one real, confirmed bug and several other findings:
 - **Hardened**: `_on_page_navigated()` now explicitly clears every open handle when the
   current origin can't be determined at all, rather than relying solely on a per-handle
   inequality check.
+- **Fixed**: `@Slot(str, result=str)` was misattached to the private helper
+  `_enumerate_filtered_devices()` instead of `requestDeviceChooser()` — the actual
+  `navigator.usb.requestDevice()` implementation that `WEBUSB_POLYFILL_JS` calls via
+  `callBridge('requestDeviceChooser', JSON.stringify(...))`. Confirmed against a real
+  `staticMetaObject` (not just static reading) that `requestDeviceChooser` was completely
+  absent from the registered Qt slots — QWebChannel could never have exposed it to JS — while
+  the helper (whose real parameters are `usb_core`/`usb_util` module handles and
+  `filters`/`exclusion_filters` lists, nothing resembling a `QString`) was registered instead.
+  All existing tests call `requestDeviceChooser()` as a plain Python method, so none of them
+  could catch this class of bug. Added `test_requestDeviceChooser_is_registered_as_qt_slot`,
+  which asserts slot registration directly via `staticMetaObject`/`QMetaMethod`, and confirmed
+  it fails against the broken version before re-fixing.
 - Considered and deliberately **not** implemented: a lock around `_open_devices` (Qt's
   single-threaded event loop model means the claimed race condition doesn't apply here, and
   a mis-applied lock would be a worse bug than none) and USB handle-ID recycling (recycling
