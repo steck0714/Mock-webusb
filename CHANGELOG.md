@@ -2,6 +2,127 @@
 
 All notable changes to this project are documented here.
 
+## [0.0.1a0] — WebUSB spec gap audit
+
+A line-by-line audit against the actual WebUSB spec source (`WICG/webusb`'s `index.bs`,
+fetched directly from GitHub rather than relying on recollection of the rendered page) and
+the real `pyusb` API (installed and introspected, not assumed from memory), looking
+specifically for spec-defined behavior this implementation didn't yet have, and for bugs the
+existing test suite's blind spots could be hiding.
+
+### Fixed
+- **`bulkTransferIn()` was missing the IN direction bit.** The spec's
+  `transferIn(endpointNumber, length)` algorithm computes
+  `endpointAddress = endpointNumber | 0x80` before touching the device; this implementation
+  passed `endpointNumber` straight through to `pyusb`'s `Device.read()`, whose `endpoint`
+  parameter is documented (confirmed from the installed pyusb source) to require the full
+  `bEndpointAddress`, not the bare number. In practice `device.transferIn(1, ...)` was
+  targeting address `0x01` (endpoint 1 **OUT**) instead of `0x81` (endpoint 1 **IN**) — real
+  IN transfers would have failed against essentially any actual device.
+  `bulkTransferOut`/`transferOut` were unaffected (OUT is address `endpointNumber` unchanged,
+  per the same spec algorithm). Added `test_bulkTransferIn_adds_the_in_direction_bit`, which
+  opens a fake device and asserts the exact byte passed to the mocked `.read()`/`.write()`
+  calls; confirmed it fails against the unfixed code (`assert 1 == 129`) before re-fixing.
+- **`requestDeviceChooser()` had no reentrancy guard.** The chooser dialog is shown with
+  `QDialog.exec()`, which runs a nested Qt event loop; a second call to
+  `requestDeviceChooser()` arriving on the same `WebUSBBridge` instance while that nested loop
+  is running (double-invocation from the page, a queued `QWebChannel` message serviced
+  mid-loop, etc.) would reenter the method and could open a second chooser on top of the
+  first. Added a `_chooser_active` guard — `requestDeviceChooser()` is now a thin wrapper with
+  a `try`/`finally` around the actual implementation, which moved to
+  `_request_device_chooser_impl` (deliberately **not** `@Slot`-decorated, and now covered by
+  the existing `test_requestDeviceChooser_is_registered_as_qt_slot` so it can't silently
+  become JS-reachable later). A reentrant call now gets an immediate `InvalidStateError`
+  instead of a second dialog. Added `test_requestDeviceChooser_reentrancy_guard`, which
+  reenters from inside the (fake) dialog's `exec()`; confirmed it fails against the unguarded
+  code — it actually hits Python's recursion limit (`maximum recursion depth exceeded`), a
+  fairly vivid demonstration of why the guard matters — before re-fixing.
+  `polyfill.py`'s `requestDevice()` previously discarded `res.error` for any
+  `cancelled: true` response and always reported a generic `NotFoundError('No device
+  selected.')`; it now routes through `throwFromResult` (extended to recognize an
+  `InvalidStateError:` prefix, alongside the existing `SecurityError:` one) so this new
+  rejection reason — and any other real failure — is no longer indistinguishable from the user
+  simply clicking Cancel.
+- **`controlTransferIn`/`controlTransferOut` could bypass `claimInterface()`'s protected-class
+  rejection entirely.** The spec runs a [control transfer validation
+  algorithm](https://wicg.github.io/webusb/#control-transfer-validation-algorithm) before
+  every control transfer — reject `requestType: 'class'` requests targeting a protected-class
+  interface, reject `recipient: 'interface'`/`'endpoint'` requests targeting a protected-class
+  interface, require the owning interface to actually be claimed for those two recipients, and
+  restrict `requestType: 'standard'` to a handful of read-only requests — and this
+  implementation ran none of it. In practice a page could skip `claimInterface()` altogether
+  (which does reject protected classes like HID) and reach the same interface directly with
+  `controlTransferOut({requestType: 'class', recipient: 'interface', index: <that interface
+  number>, ...}, data)`, which went straight through to `pyusb.ctrl_transfer()` with no check
+  at all. Added `_control_transfer_validation_error()`, called from both methods before
+  touching the device, decoding `requestType`/`recipient` directly from the `bmRequestType`
+  byte already being constructed (no new parameters needed from JS). Added three regression
+  tests covering the class-request bypass, the interface-recipient claim requirement, and the
+  standard-request restrictions; confirmed each fails against a copy with the two call sites
+  removed.
+- **`interface_class_for()`'s "not found" sentinel silently defeated the safety fallback it
+  was meant to feed.** It returned `-1` for an interface number that doesn't exist on the
+  device, documented as "let the caller fail safe (reject)" — but `is_protected_interface_class()`
+  only falls back to "reject" when `int(...)` *raises* (`TypeError`/`ValueError`), and
+  `int(-1)` doesn't raise; `-1 not in PROTECTED_INTERFACE_CLASSES` cleanly evaluates to
+  `False`, i.e. "not protected." Reproduced directly at a Python prompt:
+  `is_protected_interface_class(-1)` really does return `False`. `claimInterface()` uses
+  exactly this pair of calls, so an interface number that doesn't match any real interface was
+  being treated as safe to claim instead of rejected. Changed the sentinel to `None`, which
+  `is_protected_interface_class()` already handles correctly through the same fallback
+  (`int(None)` raises `TypeError`). Added `test_unknown_interface_number_treated_as_protected`;
+  confirmed it fails against the `-1` version.
+
+### Added
+Missing pieces found by comparing the descriptor-building code against the spec's IDL and
+algorithms — gaps, not bugs in existing behavior:
+- **`PROTECTED_INTERFACE_CLASSES` was missing Hub (`0x09`).** The spec's own
+  [protected interface classes](https://wicg.github.io/webusb/#h-protected-classes) table
+  lists 8 classes; this implementation had 7 (Hub was the omission). `claimInterface()` would
+  previously have allowed claiming a Hub-class interface. Added
+  `test_hub_interface_flagged_protected`.
+- **`USBConfiguration.configurationName`** and **`USBAlternateInterface.interfaceName`** —
+  spec-defined attributes (the `iConfiguration`/`iInterface` string descriptors, confirmed
+  present on `pyusb`'s `Configuration`/`Interface` objects from their actual source) that
+  `build_configurations_tree()` never populated; the keys simply didn't exist in the returned
+  descriptor. Both fall back to `None` when the device doesn't define the string (index `0`),
+  matching how `manufacturerName`/`productName`/`serialNumber` already behave. Added
+  `test_configuration_and_interface_names`.
+- **Endpoints list no longer includes Control-Transfer-Type descriptors.** The spec's
+  `USBAlternateInterface` construction steps explicitly skip descriptors whose `bmAttributes`
+  indicates Control Transfer Type, noting "there shouldn't be any endpoint object belongs to
+  Control Transfer Type" — and `USBEndpointType` doesn't even define a `"control"` value
+  (only `"bulk"`/`"interrupt"`/`"isochronous"`). Real device descriptors essentially never
+  trigger this in practice, but the implementation now matches the spec's own stated
+  invariant instead of an implicit assumption. Added
+  `test_control_type_endpoint_excluded_from_endpoints`.
+
+Every item above (in both this section and the two new entries added to *Fixed*) was verified
+to fail against a reverted copy of the code before being re-fixed, following the same practice
+as the `0.0.0` entries below.
+
+### Verified against the spec / real sources — no change needed
+Things this audit specifically checked and found already correct, recorded here rather than
+silently passed over:
+- The known-security-key blocklist (43 entries) matches Chromium's actual `usb_blocklist.cc`
+  byte-for-byte (fetched live from `github.com/chromium/chromium`).
+- `device_matches_usb_filter()`'s classCode/subclassCode/protocolCode precedence — including
+  the "any interface matches → match, independent of the device-level class" short-circuit —
+  matches the spec's filter-matching algorithm step for step.
+- `claimInterface()`/`releaseInterface()` on an already-claimed/already-released interface
+  resolve successfully rather than erroring, per spec — confirmed this falls out of `pyusb`'s
+  own `claim_interface()`/`release_interface()` being idempotent (read from the installed
+  `pyusb` source), so no explicit guard was needed on top.
+- `set_configuration()`'s parameter is the actual `bConfigurationValue`, not a 0-based index
+  (confirmed from the installed `pyusb` source), matching how `selectConfiguration()` already
+  called it.
+
+### Project metadata
+- Version bumped to `0.0.1a0` — this is pre-1.0, alpha-stage software, and the version number
+  now says so explicitly rather than reading `0.0.0`.
+- `pyproject.toml`'s `Homepage`/`Issues` URLs point at the actual repository,
+  `https://github.com/steck0714/Mock-webusb`, instead of the `YOUR_USERNAME` placeholder.
+
 ## [0.0.0] — initial extraction
 
 Initial standalone extraction of the WebUSB implementation from the `openweb` browser

@@ -56,11 +56,17 @@ class WebUSBBridge(QObject):
     「何が起きても必ず有効なJSON文字列を返す」ことを徹底している。
 
     セキュリティモデルの要点(詳しくはREADME参照):
-      - Audio/HID/Mass Storage/Smart Card/Video/Audio-Video/Wireless Controller
-        の7つの「保護対象インターフェースクラス」はclaimInterface自体を拒否する
-        (WebUSB仕様が定めるものと同じ一覧)。
+      - Audio/HID/Mass Storage/Hub/Smart Card/Video/Audio-Video/Wireless Controller
+        の8つの「保護対象インターフェースクラス」はclaimInterface自体を拒否する
+        (WebUSB仕様 #protected-interface-classes が定めるものと同じ一覧)。
       - 上記に加えて、既知のFIDO/セキュリティキー製品をvendor_id/product_id単位で
         ブロックリスト化(Chromiumのusb_blocklist.cc準拠)。
+      - claimInterfaceの保護は controlTransferIn/Out からも回避できない:
+        requestType:'class'や recipient:'interface'/'endpoint' で保護対象クラスや
+        未claimのインターフェースを直接狙う呼び出しは、実機に届く前に
+        _control_transfer_validation_error() で拒否する
+        (WebUSB仕様の「check the validity of the control transfer parameters」
+        アルゴリズム相当)。
       - requestDevice()はユーザーが実際に選んだ1台の情報しかサイトに渡さない
         (チューザーダイアログでの明示的な操作が必須)。
       - オリジン単位の許可の一覧化・個別失効・全失効API。
@@ -89,6 +95,13 @@ class WebUSBBridge(QObject):
         self._settings_application = settings_application
         self._open_devices = {}   # handle_id(int) -> {"device":.., "origin":.., "claimed_interfaces": set()}
         self._next_handle = 1
+        # 🛡️ requestDeviceChooser()の再入防止フラグ。dlg.exec()はネストしたQtイベント
+        #    ループを回すため、その最中に(同じページからの連打や、別タブ/別フレーム
+        #    経由で)requestDeviceChooser()がもう一度呼ばれると、このメソッドが
+        #    再入してチューザーダイアログが二重に開いてしまう恐れがある
+        #    (WebUSBBridgeインスタンスはページ単位なので、同一インスタンスへの
+        #    再入だけを防げば十分)。
+        self._chooser_active = False
         # 🛡️ ページが別オリジンへ遷移したら、開きっぱなしのUSBハンドルを即座に破棄する。
         #    (サイトAが開いたハンドル番号をサイトBが使い回して乗っ取る、を防ぐ)
         #    parentは実際にはこのブリッジを保持する QWebEnginePage。
@@ -385,7 +398,6 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"devices": [], "error": safe_error_str(e)})
 
-    @Slot(str, result=str)
     def _enumerate_filtered_devices(self, usb_core, usb_util, filters, exclusion_filters):
         """列挙 + ブロックリスト除外 + filters/exclusionFiltersでの絞り込みを行い、
         チューザー表示用の軽量デバイス記述子のリストを返す。requestDeviceChooser()の
@@ -435,8 +447,29 @@ class WebUSBBridge(QObject):
             print(f"[pyside6-webusb] _enumerate_filtered_devices: 例外を無視: {e}")  # 並べ替えに失敗しても一覧表示自体は継続する
         return devices_info
 
+    @Slot(str, result=str)
     def requestDeviceChooser(self, options_json):
-        """navigator.usb.requestDevice() 相当。実デバイス選択ダイアログを表示し、
+        """navigator.usb.requestDevice() 相当。実処理は _request_device_chooser_impl()
+        に委譲し、ここでは再入防止ガードだけを担う。
+        🛡️ dlg.exec()(_request_device_chooser_impl内)はネストしたQtイベントループを
+        回すため、その最中に同じWebUSBBridgeインスタンスへ対してもう一度
+        requestDeviceChooser()が呼ばれる(ページの連打や、QWebChannelメッセージが
+        ネストループ中に処理される等)と、チューザーダイアログが二重に開いてしまう
+        恐れがある。try/finallyで確実にフラグを解除することで、内部実装側の
+        どの return/例外経路を通っても再入状態が残留しないようにしている。"""
+        if self._chooser_active:
+            return json.dumps({
+                "cancelled": True,
+                "error": "InvalidStateError: a device chooser is already open for this page",
+            })
+        self._chooser_active = True
+        try:
+            return self._request_device_chooser_impl(options_json)
+        finally:
+            self._chooser_active = False
+
+    def _request_device_chooser_impl(self, options_json):
+        """navigator.usb.requestDevice() の実処理本体。実デバイス選択ダイアログを表示し、
         ユーザーが明示的に選んだ場合のみデバイス情報を返す（WebUSB本来のセキュリティ設計を踏襲）。
         ★ メソッド全体を try/except で包み、ダイアログ表示中の例外でアプリが落ちないようにしている。
         ★ options.filters/exclusionFiltersによる絞り込み(WebUSB仕様
@@ -446,7 +479,9 @@ class WebUSBBridge(QObject):
         構造的に妥当なfilters/exclusionFiltersが来る前提で一致判定だけを行う。
         filtersが空リストの場合は仕様どおり「一致するデバイスなし」となる。
         ★ Chromeの実際のチューザーを参考に、(1)要求元オリジンを明示、
-        (2)ダイアログを開いたままの接続/切断でライブ更新、を行う。"""
+        (2)ダイアログを開いたままの接続/切断でライブ更新、を行う。
+        ★ @Slotをあえて付けていない: QWebChannel/JSから直接叩けるのは
+        requestDeviceChooser()(再入防止ガード込み)だけにするため。"""
         try:
             try:
                 options = json.loads(options_json) if options_json else {}
@@ -684,12 +719,21 @@ class WebUSBBridge(QObject):
 
     @Slot(int, int, int, result=str)
     def bulkTransferIn(self, handle_id, endpoint, length):
+        """USBDevice.transferIn(endpointNumber, length) 相当。
+        🛡️ 実仕様: 'Let endpointAddress be endpointNumber | 0x80' — JSから渡ってくる
+        endpointはIN/OUTの方向ビットを含まない生のendpointNumber(spec/JS両方の呼称)
+        であり、実際にpyusbへ渡す必要があるbEndpointAddress(方向ビット込み)へは
+        ここで変換しなければならない(pyusb公式ドキュメント: 'The endpoint parameter
+        corresponds to the bEndpointAddress member' — endpointNumberそのものではない)。
+        旧実装はこの変換が丸ごと抜けており、endpoint=1のIN転送がbEndpointAddress=0x01
+        (=同じ番号のOUT側)を叩きにいってしまい、実機相手には常に失敗していた。"""
         try:
             dev = self._get_open_device(handle_id)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
+            endpoint_address = endpoint | 0x80
             try:
-                data = dev.read(endpoint, length, timeout=5000)
+                data = dev.read(endpoint_address, length, timeout=5000)
             except Exception as e:
                 # 🛡️ 実仕様: STALLはPromiseのreject対象ではなく、status:'stall'を
                 #    伴う"成功"resolveとして返す(呼び出し側がclearHalt()で解除して
@@ -718,12 +762,105 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
+    def _control_transfer_validation_error(self, handle_id, dev, request_type, request, index):
+        """WebUSB仕様「check the validity of the control transfer parameters」
+        (index.bs, controlTransferIn/Outの手前で毎回走る前提のアルゴリズム)の
+        うちPython側でしか判定できない部分 -- インターフェースが保護対象クラスか、
+        実際にclaim済みか -- をここで最終防衛として検証する。
+        🛡️ この検証が無いと、claimInterface()自体は保護対象クラス(HID等)を
+        拒否していても、controlTransferIn/Out に requestType:'class' や
+        recipient:'interface'/'endpoint' を指定して直接その保護対象インターフェースへ
+        生のコントロール転送を送れてしまい、claimInterfaceの保護を完全にバイパス
+        できる状態だった(実際にJS/Python双方のコードを読んで確認した抜け穴で、
+        テストも無かった)。
+        妥当なら None、そうでなければ json.dumps済みのエラーレスポンス文字列を返す。
+        bmRequestType(request_type)からの復号は仕様どおりのビット割り当て:
+          bit7    : 方向(1=IN)。ここではrequestTypeそのものから読めるので
+                    JSから別途directionを受け取る必要が無い。
+          bit6-5  : requestType種別(00=standard, 01=class, 10=vendor)
+          bit1-0  : recipient種別(00=device, 01=interface, 10=endpoint, 11=other)
+        (polyfill.py側のreqType組み立てロジックと1対1で対応する)。"""
+        info = self._open_devices.get(handle_id) or {}
+        claimed = info.get("claimed_interfaces", set())
+        direction_in = bool(request_type & 0x80)
+        req_kind = (request_type >> 5) & 0x03      # 0=standard,1=class,2=vendor
+        recipient = request_type & 0x03            # 0=device,1=interface,2=endpoint,3=other
+
+        def _err(name, msg):
+            return json.dumps({"success": False, "error": f"{name}: {msg}"})
+
+        if req_kind == 0:  # standard
+            if not direction_in:
+                return _err("SecurityError", "standard requests are not allowed for controlTransferOut")
+            if request not in (0x00, 0x06, 0x08, 0x0A, 0x0C):
+                return _err(
+                    "SecurityError",
+                    f"standard request {request:#04x} is not one of the requests allowed by the "
+                    "WebUSB spec (GET_STATUS/GET_DESCRIPTOR/GET_CONFIGURATION/GET_INTERFACE/SYNCH_FRAME)",
+                )
+
+        if req_kind == 1:  # class
+            iface_number = index & 0xFF
+            iface_class = interface_class_for(dev, iface_number)
+            if is_protected_interface_class(iface_class):
+                name = protected_class_name(iface_class)
+                return _err(
+                    "SecurityError",
+                    f"interface {iface_number} is class '{name}', a protected interface class, "
+                    "and cannot receive class-specific control requests",
+                )
+
+        if recipient == 1:  # interface
+            iface_number = index & 0xFF
+            iface_class = interface_class_for(dev, iface_number)
+            if iface_class is None:
+                return _err("NotFoundError", f"interface {iface_number} was not found on this device")
+            if is_protected_interface_class(iface_class):
+                name = protected_class_name(iface_class)
+                return _err("SecurityError", f"interface {iface_number} is class '{name}', a protected interface class")
+            if iface_number not in claimed:
+                return _err("InvalidStateError", f"interface {iface_number} has not been claimed")
+
+        if recipient == 2:  # endpoint
+            # 仕様: recipient=="endpoint"の場合は setup.index そのものがendpointAddress
+            # (interface/classのように下位8bitへ切り詰めない)。実運用上のindexは
+            # 常に1バイトに収まる値なので & 0xFF は安全側の正規化として扱う。
+            endpoint_address = index & 0xFF
+            owner_number, owner_class = None, None
+            try:
+                for cfg in dev:
+                    for intf in cfg:
+                        for ep in intf:
+                            if getattr(ep, "bEndpointAddress", None) == endpoint_address:
+                                owner_number, owner_class = intf.bInterfaceNumber, intf.bInterfaceClass
+                                raise StopIteration
+            except StopIteration:
+                pass
+            except Exception:
+                pass
+            if owner_number is None:
+                return _err("NotFoundError", f"endpoint {endpoint_address:#04x} was not found on this device")
+            if is_protected_interface_class(owner_class):
+                name = protected_class_name(owner_class)
+                return _err(
+                    "SecurityError",
+                    f"endpoint {endpoint_address:#04x} belongs to interface class '{name}', "
+                    "a protected interface class",
+                )
+            if owner_number not in claimed:
+                return _err("InvalidStateError", f"interface {owner_number} owning endpoint {endpoint_address:#04x} has not been claimed")
+
+        return None
+
     @Slot(int, int, int, int, int, int, result=str)
     def controlTransferIn(self, handle_id, request_type, request, value, index, length):
         try:
             dev = self._get_open_device(handle_id)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
+            validation_error = self._control_transfer_validation_error(handle_id, dev, request_type, request, index)
+            if validation_error is not None:
+                return validation_error
             try:
                 data = dev.ctrl_transfer(request_type, request, value, index, length, timeout=5000)
             except Exception as e:
@@ -740,6 +877,9 @@ class WebUSBBridge(QObject):
             dev = self._get_open_device(handle_id)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
+            validation_error = self._control_transfer_validation_error(handle_id, dev, request_type, request, index)
+            if validation_error is not None:
+                return validation_error
             try:
                 written = dev.ctrl_transfer(request_type, request, value, index, bytes.fromhex(data_hex), timeout=5000)
             except Exception as e:

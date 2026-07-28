@@ -25,8 +25,8 @@ UsbHotplugWatcher をアプリ起動時に起動する、という使い方を�
     ブラウザベンダー間でのおおむね共通した認識である。
 * Chromium自身は上記のリスクを軽減するため、単なる「サイトへの許可」以外に
   少なくとも次の多層防御を実装している:
-    (1) 「保護対象インターフェースクラス」: Audio / HID / Mass Storage /
-        Smart Card / Video / Audio-Video / Wireless Controller の7クラスは
+    (1) 「保護対象インターフェースクラス」: Audio / HID / Mass Storage / Hub /
+        Smart Card / Video / Audio-Video / Wireless Controller の8クラスは
         claimInterface自体をブラウザ側で拒否する(これらは別の専用API
         [WebHID・WebMIDI等]や高レベルOS機能が既にあり、WebUSBで生アクセス
         させる必要が無いため)。
@@ -40,8 +40,10 @@ UsbHotplugWatcher をアプリ起動時に起動する、という使い方を�
 
 出典:
   - WebUSB仕様: https://wicg.github.io/webusb/
-  - 保護対象インターフェースクラス7種の一覧: Chromium blink-dev ML
-    "Intent to Implement and Ship: WebUSB Interface Class Filtering" (2019)
+  - 保護対象インターフェースクラス8種の一覧: WebUSB仕様本文
+    (index.bs の「Protected interface classes」表, #protected-interface-classes)
+    を2026年7月に一次ソース(github.com/WICG/webusb)から直接取得して突き合わせ、
+    Hub(0x09)が本実装から漏れていたことを確認・追加した。
   - デバイスブロックリスト: chrome/browser/usb/usb_blocklist.cc
     (https://github.com/chromium/chromium/blob/main/chrome/browser/usb/usb_blocklist.cc
      2026年7月時点のmainブランチより、vendor_id/product_idの組のみを移植。
@@ -73,6 +75,7 @@ PROTECTED_INTERFACE_CLASSES = {
     0x01: "Audio",
     0x03: "HID (Human Interface Device: セキュリティキー/キーボード/マウス等の大半)",
     0x08: "Mass Storage",
+    0x09: "Hub",
     0x0B: "Smart Card (CCID)",
     0x0E: "Video",
     0x10: "Audio/Video",
@@ -241,18 +244,37 @@ def build_configurations_tree(dev, usb_util) -> list:
             for intf in cfg:
                 try:
                     inum = intf.bInterfaceNumber
+                    # 🛡️ spec: USBAlternateInterface.interfaceName は
+                    #    「interface descriptorのiInterfaceが指すstring descriptorの値」
+                    #    (pyusbのInterfaceオブジェクトはiInterface属性を公開していることを
+                    #    ソース確認済み)。取得できない/未定義な機器も多いため、他の文字列
+                    #    記述子(manufacturer/product/serial)と同じくベストエフォートで
+                    #    Noneにフォールバックする。
+                    interface_name = None
+                    try:
+                        if getattr(intf, "iInterface", 0):
+                            interface_name = usb_util.get_string(dev, intf.iInterface)
+                    except Exception:
+                        pass
                     alt = {
                         "alternateSetting": intf.bAlternateSetting,
                         "interfaceClass": intf.bInterfaceClass,
                         "interfaceSubclass": intf.bInterfaceSubClass,
                         "interfaceProtocol": intf.bInterfaceProtocol,
                         "interfaceProtected": is_protected_interface_class(intf.bInterfaceClass),
+                        "interfaceName": interface_name,
                         "endpoints": [],
                     }
                     for ep in intf:
                         try:
-                            direction = usb_util.endpoint_direction(ep.bEndpointAddress)
                             ep_type = usb_util.endpoint_type(ep.bmAttributes)
+                            # 🛡️ spec(USBAlternateInterface constructor): bmAttributesが
+                            #    Control Transfer Type(下位2bitが00)を示す記述子は
+                            #    endpoints一覧から除外する("There shouldn't be any endpoint
+                            #    object belongs to Control Transfer Type" との注記どおり)。
+                            if ep_type == usb_util.ENDPOINT_TYPE_CTRL:
+                                continue
+                            direction = usb_util.endpoint_direction(ep.bEndpointAddress)
                             alt["endpoints"].append({
                                 "endpointNumber": ep.bEndpointAddress & 0x0F,
                                 "direction": "in" if direction == usb_util.ENDPOINT_IN else "out",
@@ -260,7 +282,6 @@ def build_configurations_tree(dev, usb_util) -> list:
                                     usb_util.ENDPOINT_TYPE_BULK: "bulk",
                                     usb_util.ENDPOINT_TYPE_INTR: "interrupt",
                                     usb_util.ENDPOINT_TYPE_ISO: "isochronous",
-                                    usb_util.ENDPOINT_TYPE_CTRL: "control",
                                 }.get(ep_type, "unknown"),
                                 "packetSize": getattr(ep, "wMaxPacketSize", 0),
                             })
@@ -274,8 +295,19 @@ def build_configurations_tree(dev, usb_util) -> list:
                 {"interfaceNumber": inum, "alternates": alts}
                 for inum, alts in sorted(interfaces_by_number.items())
             ]
+            # 🛡️ spec: USBConfiguration.configurationName は
+            #    「configuration descriptorのiConfigurationが指すstring descriptorの値」
+            #    (pyusbのConfigurationオブジェクトはiConfiguration属性を公開していることを
+            #    ソース確認済み)。
+            configuration_name = None
+            try:
+                if getattr(cfg, "iConfiguration", 0):
+                    configuration_name = usb_util.get_string(dev, cfg.iConfiguration)
+            except Exception:
+                pass
             configurations.append({
                 "configurationValue": getattr(cfg, "bConfigurationValue", 0),
+                "configurationName": configuration_name,
                 "interfaces": interfaces_list,
             })
         except Exception:
@@ -286,8 +318,14 @@ def build_configurations_tree(dev, usb_util) -> list:
 def interface_class_for(dev, interface_number):
     """指定インターフェース番号のbInterfaceClassを取得する
     (claimInterface時のHID等ブロック判定に使う)。取得できない場合は
-    Noneではなく「不明」を意味する特別値(-1)を返し、呼び出し側が
-    安全側(拒否)に倒せるようにする。"""
+    -1ではなくNoneを返す。
+    🛡️ 修正: 以前は見つからない場合に-1を返していたが、int(-1)は例外を
+    投げないため is_protected_interface_class() の「判定不能なら安全側(拒否)に
+    倒す」というTypeError/ValueErrorフォールバックを素通りしてしまい、
+    -1 not in PROTECTED_INTERFACE_CLASSES → False(=保護対象でない)と
+    誤判定されていた(実際にclaimInterface()でこの経路を通ると確認済み)。
+    Noneであればint(None)がTypeErrorを送出するため、既存のフォールバックが
+    意図どおり「不明なら拒否」として機能する。"""
     try:
         for cfg in dev:
             for intf in cfg:
@@ -295,7 +333,7 @@ def interface_class_for(dev, interface_number):
                     return intf.bInterfaceClass
     except Exception:
         pass
-    return -1
+    return None
 
 
 # ============================================================

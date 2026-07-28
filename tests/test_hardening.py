@@ -19,22 +19,24 @@ class FakeEndpoint:
 
 
 class FakeInterface:
-    def __init__(self, number, alt, iclass, isub, iproto, endpoints):
+    def __init__(self, number, alt, iclass, isub, iproto, endpoints, iInterface=0):
         self.bInterfaceNumber = number
         self.bAlternateSetting = alt
         self.bInterfaceClass = iclass
         self.bInterfaceSubClass = isub
         self.bInterfaceProtocol = iproto
         self._endpoints = endpoints
+        self.iInterface = iInterface
 
     def __iter__(self):
         return iter(self._endpoints)
 
 
 class FakeConfiguration:
-    def __init__(self, value, interfaces):
+    def __init__(self, value, interfaces, iConfiguration=0):
         self.bConfigurationValue = value
         self._interfaces = interfaces
+        self.iConfiguration = iConfiguration
 
     def __iter__(self):
         return iter(self._interfaces)
@@ -82,7 +84,7 @@ class FakeUsbUtil:
     ENDPOINT_TYPE_BULK = 2
     ENDPOINT_TYPE_INTR = 3
 
-    STRINGS = {1: "Acme Corp", 2: "Acme Widget", 3: "SN-0001"}
+    STRINGS = {1: "Acme Corp", 2: "Acme Widget", 3: "SN-0001", 4: "Default Config", 5: "Data Interface"}
 
     def get_string(self, dev, index):
         return self.STRINGS.get(index)
@@ -151,6 +153,86 @@ def test_hid_interface_flagged_protected():
     assert iface["alternates"][0]["interfaceProtected"] is True
     assert h.interface_class_for(dev, 0) == 0x03
     print("test_hid_interface_flagged_protected: OK")
+
+
+def test_hub_interface_flagged_protected():
+    """WebUSB仕様本文(index.bs の「Protected interface classes」表,
+    #protected-interface-classes)を一次ソースから直接確認したところ、
+    Audio/HID/Mass Storage/Smart Card/Video/Audio-Video/Wireless Controllerに加えて
+    Hub(0x09)も保護対象クラスに含まれていた。旧実装はHubが抜けたまま7クラスしか
+    登録されておらず、Hub機器のインターフェースをclaimInterfaceできてしまう状態
+    だった。"""
+    util = FakeUsbUtil()
+    assert h.is_protected_interface_class(0x09) is True  # Hub
+    intf_hub = FakeInterface(0, 0, 0x09, 0x00, 0x00, [FakeEndpoint(0x81, 0x03)])
+    cfg = FakeConfiguration(1, [intf_hub])
+    dev = FakeDevice(0x1234, 0x5678, [cfg], deviceClass=0)
+    info = h.build_device_descriptor(dev, util)
+    iface = info["configurations"][0]["interfaces"][0]
+    assert iface["alternates"][0]["interfaceProtected"] is True
+    print("test_hub_interface_flagged_protected: OK")
+
+
+def test_configuration_and_interface_names():
+    """spec: USBConfiguration.configurationName / USBAlternateInterface.interfaceName は
+    それぞれconfiguration/interface descriptorのiConfiguration/iInterfaceが指す
+    string descriptorの値(未定義の場合はNone)。旧実装はどちらも未実装で、
+    生成されるdictにキー自体が存在しなかった。"""
+    util = FakeUsbUtil()
+    ep = FakeEndpoint(0x81, 0x02)
+    intf_named = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [ep], iInterface=5)
+    intf_unnamed = FakeInterface(1, 0, 0xFF, 0x00, 0x00, [ep])  # iInterface省略 -> 0 -> None
+    cfg = FakeConfiguration(1, [intf_named, intf_unnamed], iConfiguration=4)
+    dev = FakeDevice(0x1234, 0x5678, [cfg])
+    info = h.build_device_descriptor(dev, util)
+    config_info = info["configurations"][0]
+    assert config_info["configurationName"] == "Default Config"
+    interfaces = config_info["interfaces"]
+    named = [i for i in interfaces if i["interfaceNumber"] == 0][0]
+    unnamed = [i for i in interfaces if i["interfaceNumber"] == 1][0]
+    assert named["alternates"][0]["interfaceName"] == "Data Interface"
+    assert unnamed["alternates"][0]["interfaceName"] is None, \
+        "iInterface==0(文字列記述子なし)はNoneになるべき"
+    print("test_configuration_and_interface_names: OK")
+
+
+def test_control_type_endpoint_excluded_from_endpoints():
+    """spec注記(USBAlternateInterfaceコンストラクタ手順): bmAttributesが
+    Control Transfer Type(下位2bit==00)を示すendpoint記述子はendpoints一覧から
+    除外されるべき("There shouldn't be any endpoint object belongs to Control
+    Transfer Type")。旧実装は除外しておらず、実仕様のUSBEndpointType enum
+    ("bulk"/"interrupt"/"isochronous")には存在しない"control"という値を
+    返しうる状態だった。"""
+    util = FakeUsbUtil()
+    ep_ctrl = FakeEndpoint(0x00, 0x00)  # bmAttributes下位2bit=00 -> Control
+    ep_bulk = FakeEndpoint(0x81, 0x02)  # bulk in
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [ep_ctrl, ep_bulk])
+    cfg = FakeConfiguration(1, [intf])
+    dev = FakeDevice(0x1234, 0x5678, [cfg])
+    info = h.build_device_descriptor(dev, util)
+    eps = info["configurations"][0]["interfaces"][0]["alternates"][0]["endpoints"]
+    assert len(eps) == 1, "Control転送タイプのendpointは一覧から除外されるべき"
+    assert eps[0]["endpointNumber"] == 1
+    assert all(e["type"] != "control" for e in eps)
+    print("test_control_type_endpoint_excluded_from_endpoints: OK")
+
+
+def test_unknown_interface_number_treated_as_protected():
+    """interface_class_for()が対象のインターフェース番号を見つけられなかった場合
+    (存在しないインターフェース番号が渡された等)、is_protected_interface_class()は
+    安全側(=保護対象として拒否)に倒れるべき。旧実装はinterface_class_for()の
+    「見つからない」センチネル値が-1で、int(-1)は例外を投げないため
+    is_protected_interface_class()の安全側フォールバック(TypeError/ValueError捕捉)を
+    素通りしてしまい、-1 not in PROTECTED_INTERFACE_CLASSES つまりFalse(保護対象で
+    ない)と誤判定していた(claimInterfaceが実在しないインターフェース番号に対して
+    fail-openしていた、実際にPythonで再現・確認済みのバグ)。"""
+    util = FakeUsbUtil()
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [FakeEndpoint(0x81, 0x02)])
+    cfg = FakeConfiguration(1, [intf])
+    dev = FakeDevice(0x1234, 0x5678, [cfg])
+    assert h.interface_class_for(dev, 99) is None  # インターフェース0しか無いので99は存在しない
+    assert h.is_protected_interface_class(h.interface_class_for(dev, 99)) is True
+    print("test_unknown_interface_number_treated_as_protected: OK")
 
 
 def test_hotplug_watcher_diff():
@@ -291,6 +373,10 @@ if __name__ == "__main__":
     test_bcd_to_version()
     test_descriptor_builder_arduino_like()
     test_hid_interface_flagged_protected()
+    test_hub_interface_flagged_protected()
+    test_configuration_and_interface_names()
+    test_control_type_endpoint_excluded_from_endpoints()
+    test_unknown_interface_number_treated_as_protected()
     test_hotplug_watcher_diff()
     test_is_valid_usb_device_filter()
     test_device_matches_filter_vendor_and_product_id()

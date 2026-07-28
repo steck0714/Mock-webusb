@@ -163,16 +163,26 @@ WEBUSB_POLYFILL_JS = r"""
     //    claimInterface()は仕様上「保護対象クラスによる拒否」だけがSecurityError、
     //    それ以外(ハンドル不正・libusb側のclaim失敗等)はNetworkErrorが正しい
     //    (open()の「ブロックリスト機器による拒否」も同様にSecurityErrorが正しい)。
-    //    Python側は保護クラス/ブロックリスト拒否の場合にだけエラー文字列の先頭へ
-    //    "SecurityError:"を付けて返す取り決めなので、ここではそれだけを見て
+    //    requestDeviceChooser()の「チューザーが既に開いている」再入防止ガードは
+    //    InvalidStateErrorが正しい(操作を受け付けられる状態ではない、という
+    //    一般的なDOMException用法に合わせた)。
+    //    Python側はこれらの拒否理由の場合にだけエラー文字列の先頭へ対応する
+    //    "XxxError:"を付けて返す取り決めなので、ここではそのプレフィックスだけを見て
     //    DOMExceptionの種別を仕様どおりに振り分ける。それ以外の失敗はメソッドごとの
     //    デフォルト(通常はNetworkError)のままにする。
+    var KNOWN_ERROR_PREFIXES = ['SecurityError:', 'InvalidStateError:'];
     function throwFromResult(res, defaultMessage, defaultErrorName) {
         var msg = (res && res.error) || defaultMessage;
         var name = defaultErrorName || 'NetworkError';
-        if (typeof msg === 'string' && msg.indexOf('SecurityError:') === 0) {
-            name = 'SecurityError';
-            msg = msg.slice('SecurityError:'.length).trim();
+        if (typeof msg === 'string') {
+            for (var i = 0; i < KNOWN_ERROR_PREFIXES.length; i++) {
+                var prefix = KNOWN_ERROR_PREFIXES[i];
+                if (msg.indexOf(prefix) === 0) {
+                    name = prefix.slice(0, -1); // 末尾の ':' を落とす
+                    msg = msg.slice(prefix.length).trim();
+                    break;
+                }
+            }
         }
         throw new DOMException(msg, name);
     }
@@ -416,7 +426,15 @@ WEBUSB_POLYFILL_JS = r"""
                 filters: _options.filters,
                 exclusionFilters: exclusionFilters,
             })).then(function(res) {
-                if (res.cancelled || !res.device) {
+                if (res.cancelled) {
+                    // 🛡️ res.errorがある場合(再入防止ガード発火・pyusbバックエンド不通・
+                    //    ダイアログ例外など)は実際の理由を伝える。無い場合(=ユーザーが
+                    //    素直にCancelを押した/ダイアログを閉じた)は従来どおり
+                    //    汎用のNotFoundErrorにする。
+                    if (res.error) throwFromResult(res, 'No device selected.', 'NotFoundError');
+                    throw new DOMException('No device selected.', 'NotFoundError');
+                }
+                if (!res.device) {
                     throw new DOMException('No device selected.', 'NotFoundError');
                 }
                 return new OpenWebUSBDevice(res.device);
