@@ -828,12 +828,16 @@ class WebUSBBridge(QObject):
             endpoint_address = index & 0xFF
             owner_number, owner_class = None, None
             try:
-                for cfg in dev:
-                    for intf in cfg:
-                        for ep in intf:
-                            if getattr(ep, "bEndpointAddress", None) == endpoint_address:
-                                owner_number, owner_class = intf.bInterfaceNumber, intf.bInterfaceClass
-                                raise StopIteration
+                # 🛡️ interface_class_forと同じ理由で、探索は現在アクティブな
+                #    configurationだけに限定する(非アクティブなconfiguration側の
+                #    endpointを誤って拾わないため)。アクティブなconfiguration自体が
+                #    特定できない場合は探索せず「見つからない」扱い(=安全側)にする。
+                active_cfg = dev.get_active_configuration()
+                for intf in active_cfg:
+                    for ep in intf:
+                        if getattr(ep, "bEndpointAddress", None) == endpoint_address:
+                            owner_number, owner_class = intf.bInterfaceNumber, intf.bInterfaceClass
+                            raise StopIteration
             except StopIteration:
                 pass
             except Exception:

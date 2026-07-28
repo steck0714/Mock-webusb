@@ -65,15 +65,22 @@ class FakeDevice:
         return iter(self._configurations)
 
     def get_active_configuration(self):
-        # 実pyusbのDevice.get_active_configuration()を模倣。active_config_value未指定時は
-        # 「取得できない実機」を模して例外を送出し、呼び出し側のフォールバックを検証できるようにする。
-        if self._active_config_value is None:
+        # 実pyusbのDevice.get_active_configuration()を模倣。
+        # - active_config_value=False を明示した場合だけ「取得できない実機」を
+        #   模して例外を送出する(test_active_configuration_value_none_when_unavailable専用)。
+        # - active_config_value を数値で指定した場合は、その値に一致する
+        #   FakeConfigurationを実際に返す(interfaceを反復できる、本物同様のオブジェクト)。
+        # - 何も指定しなければ、実機の典型例(configurationは1つだけ)を模して
+        #   configurationsの先頭を返す。interface_class_for()等はこれに依存する。
+        if self._active_config_value is False:
             raise RuntimeError("no active configuration (simulated)")
-        class _FakeActiveConfig:
-            pass
-        c = _FakeActiveConfig()
-        c.bConfigurationValue = self._active_config_value
-        return c
+        if self._active_config_value is not None:
+            for cfg in self._configurations:
+                if getattr(cfg, "bConfigurationValue", None) == self._active_config_value:
+                    return cfg
+        if self._configurations:
+            return self._configurations[0]
+        raise RuntimeError("no active configuration (simulated)")
 
 
 class FakeUsbUtil:
@@ -215,6 +222,28 @@ def test_control_type_endpoint_excluded_from_endpoints():
     assert eps[0]["endpointNumber"] == 1
     assert all(e["type"] != "control" for e in eps)
     print("test_control_type_endpoint_excluded_from_endpoints: OK")
+
+
+def test_interface_class_for_scoped_to_active_configuration():
+    """interface_class_for()は「現在アクティブなconfiguration」内だけを見るべきで、
+    デバイスが複数configurationを持つ場合に非アクティブ側の同番号インターフェースを
+    誤って拾ってはいけない(以前は全configurationを横断探索していた)。
+    configuration 1のインターフェース0はHID(保護対象)、configuration 2の
+    インターフェース0はvendor-specific(非保護)という、あえて逆の結果になる
+    2つのconfigurationを用意し、アクティブ側の値だけが反映されることを確認する。"""
+    hid_intf = FakeInterface(0, 0, 0x03, 0x01, 0x01, [FakeEndpoint(0x81, 0x03)])  # 保護対象
+    vendor_intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [FakeEndpoint(0x81, 0x02)])  # 非保護
+    cfg1 = FakeConfiguration(1, [hid_intf])
+    cfg2 = FakeConfiguration(2, [vendor_intf])
+
+    dev_cfg2_active = FakeDevice(0x1234, 0x5678, [cfg1, cfg2], active_config_value=2)
+    assert h.interface_class_for(dev_cfg2_active, 0) == 0xFF, "アクティブなconfig2側(vendor-specific)が採用されるべき"
+    assert h.is_protected_interface_class(h.interface_class_for(dev_cfg2_active, 0)) is False
+
+    dev_cfg1_active = FakeDevice(0x1234, 0x5678, [cfg1, cfg2], active_config_value=1)
+    assert h.interface_class_for(dev_cfg1_active, 0) == 0x03, "アクティブなconfig1側(HID)が採用されるべき"
+    assert h.is_protected_interface_class(h.interface_class_for(dev_cfg1_active, 0)) is True
+    print("test_interface_class_for_scoped_to_active_configuration: OK")
 
 
 def test_unknown_interface_number_treated_as_protected():
@@ -361,7 +390,7 @@ def test_active_configuration_value_reported_when_available():
 def test_active_configuration_value_none_when_unavailable():
     util = FakeUsbUtil()
     cfg1 = FakeConfiguration(1, [])
-    dev = FakeDevice(0x1234, 0x5678, [cfg1])  # active_config_value未指定 -> get_active_configuration()が例外
+    dev = FakeDevice(0x1234, 0x5678, [cfg1], active_config_value=False)  # 取得不能な実機を模す
     info = h.build_device_descriptor(dev, util, include_configurations=False)
     assert info["activeConfigurationValue"] is None
     print("test_active_configuration_value_none_when_unavailable: OK")
@@ -377,6 +406,7 @@ if __name__ == "__main__":
     test_configuration_and_interface_names()
     test_control_type_endpoint_excluded_from_endpoints()
     test_unknown_interface_number_treated_as_protected()
+    test_interface_class_for_scoped_to_active_configuration()
     test_hotplug_watcher_diff()
     test_is_valid_usb_device_filter()
     test_device_matches_filter_vendor_and_product_id()

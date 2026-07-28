@@ -72,6 +72,17 @@ existing test suite's blind spots could be hiding.
   `is_protected_interface_class()` already handles correctly through the same fallback
   (`int(None)` raises `TypeError`). Added `test_unknown_interface_number_treated_as_protected`;
   confirmed it fails against the `-1` version.
+- **`interface_class_for()` (and the new endpoint-recipient check above) searched every
+  configuration the device declares, not just the currently active one.** For the very common
+  case of a single-configuration device this made no difference, but on a device with more
+  than one configuration, an inactive configuration's interface could be found first and used
+  for the protected-class/claimed check instead of the interface that's actually reachable
+  right now. Both now call `pyusb`'s `get_active_configuration()` first and search only within
+  it, falling back to "unknown → protected" (same as the previous fix) if the active
+  configuration itself can't be determined. Added
+  `test_interface_class_for_scoped_to_active_configuration`, using two configurations that
+  deliberately disagree about interface 0's class so a wrong scope produces a wrong class;
+  confirmed it fails against the unscoped search.
 
 ### Added
 Missing pieces found by comparing the descriptor-building code against the spec's IDL and
@@ -97,9 +108,9 @@ algorithms — gaps, not bugs in existing behavior:
   invariant instead of an implicit assumption. Added
   `test_control_type_endpoint_excluded_from_endpoints`.
 
-Every item above (in both this section and the two new entries added to *Fixed*) was verified
-to fail against a reverted copy of the code before being re-fixed, following the same practice
-as the `0.0.0` entries below.
+Every item above (in both this section and the three new entries added to *Fixed*) was
+verified to fail against a reverted copy of the code before being re-fixed, following the same
+practice as the `0.0.0` entries below.
 
 ### Verified against the spec / real sources — no change needed
 Things this audit specifically checked and found already correct, recorded here rather than

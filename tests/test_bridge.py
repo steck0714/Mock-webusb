@@ -74,6 +74,15 @@ class FakeDevice:
     def __iter__(self):
         return iter(self._configurations)
 
+    def get_active_configuration(self):
+        # 🛡️ 実pyusbのDevice.get_active_configuration()を模倣。このテストファイルの
+        #    フィクスチャは常にconfigurationを1つしか構築しないため、単純に先頭を返す
+        #    (test_hardening.py側のFakeDeviceのように「未設定なら例外」という
+        #    より作り込んだ挙動は、このファイルでは今のところ不要)。
+        if not self._configurations:
+            raise ValueError("no active configuration")
+        return self._configurations[0]
+
     def read(self, endpoint, length, timeout=None):
         # 🛡️ pyusb実物のDevice.read()を模倣: endpointはbEndpointAddress(方向ビット込み)
         #    を要求する。呼び出し時に実際に渡された値を記録しておき、

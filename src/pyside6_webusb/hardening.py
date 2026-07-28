@@ -316,21 +316,31 @@ def build_configurations_tree(dev, usb_util) -> list:
 
 
 def interface_class_for(dev, interface_number):
-    """指定インターフェース番号のbInterfaceClassを取得する
-    (claimInterface時のHID等ブロック判定に使う)。取得できない場合は
-    -1ではなくNoneを返す。
-    🛡️ 修正: 以前は見つからない場合に-1を返していたが、int(-1)は例外を
+    """指定インターフェース番号のbInterfaceClassを、デバイスの現在アクティブな
+    configuration内から取得する(claimInterface/controlTransfer検証時のHID等
+    ブロック判定に使う)。取得できない場合は-1ではなくNoneを返す。
+    🛡️ 修正1: 以前は見つからない場合に-1を返していたが、int(-1)は例外を
     投げないため is_protected_interface_class() の「判定不能なら安全側(拒否)に
     倒す」というTypeError/ValueErrorフォールバックを素通りしてしまい、
     -1 not in PROTECTED_INTERFACE_CLASSES → False(=保護対象でない)と
     誤判定されていた(実際にclaimInterface()でこの経路を通ると確認済み)。
     Noneであればint(None)がTypeErrorを送出するため、既存のフォールバックが
-    意図どおり「不明なら拒否」として機能する。"""
+    意図どおり「不明なら拒否」として機能する。
+    🛡️ 修正2: 以前はデバイスが持つ全configurationを横断的に探索していたが、
+    実際にclaimでき/コントロール転送の対象になり得るインターフェースは常に
+    「現在アクティブなconfiguration」内のものだけ(spec上の判定対象も同様)。
+    ほとんどの実機はconfigurationを1つしか持たないため実害は小さいが、複数
+    configurationを持つ機器では、非アクティブ側にたまたま同じ番号のインター
+    フェースがあった場合にそちらを誤って拾ってしまう可能性があった。
+    アクティブなconfiguration自体が特定できない場合も安全側(None)に倒す。"""
     try:
-        for cfg in dev:
-            for intf in cfg:
-                if intf.bInterfaceNumber == interface_number:
-                    return intf.bInterfaceClass
+        cfg = dev.get_active_configuration()
+    except Exception:
+        return None
+    try:
+        for intf in cfg:
+            if intf.bInterfaceNumber == interface_number:
+                return intf.bInterfaceClass
     except Exception:
         pass
     return None
