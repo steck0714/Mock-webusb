@@ -54,6 +54,30 @@ class FakeConfiguration:
         return iter(self._interfaces)
 
 
+class _FakeCtx:
+    def __init__(self, handle):
+        self.handle = handle
+
+
+class _FakeIsoBackend:
+    """usb.backend.libusb1._LibUSB の iso_read/iso_write を模したフェイク。
+    実物の挙動(バッファをその場で埋める/書き込みバイト数を返す)を模倣する。"""
+
+    def __init__(self):
+        self.iso_read_calls = []
+        self.iso_write_calls = []
+
+    def iso_read(self, dev_handle, ep, intf, buff, timeout=None):
+        self.iso_read_calls.append({"dev_handle": dev_handle, "ep": ep, "intf": intf, "len": len(buff), "timeout": timeout})
+        for i in range(len(buff)):
+            buff[i] = 0xEE
+        return len(buff)
+
+    def iso_write(self, dev_handle, ep, intf, buff, timeout=None):
+        self.iso_write_calls.append({"dev_handle": dev_handle, "ep": ep, "intf": intf, "data": bytes(buff), "timeout": timeout})
+        return len(buff)
+
+
 class FakeDevice:
     def __init__(self, idVendor, idProduct, configurations,
                  deviceClass=0, deviceSubClass=0, deviceProtocol=0,
@@ -70,6 +94,18 @@ class FakeDevice:
         self.iManufacturer = iManufacturer
         self.iProduct = iProduct
         self.iSerialNumber = iSerialNumber
+        # 🛡️ isochronous転送(_iso_backend_or_error)向け。既定ではNoneのままにし、
+        #    「backendが無い実機/バックエンド」を模す(既存の全テストはこれで
+        #    isochronousを試みればNotSupportedErrorへ安全にフォールバックする)。
+        #    isochronousの成功パスをテストしたい場合だけenable_fake_iso_backend()
+        #    を呼ぶ。
+        self.backend = None
+        self._ctx = None
+
+    def enable_fake_iso_backend(self):
+        self.backend = _FakeIsoBackend()
+        self._ctx = _FakeCtx(handle=f"handle-{self.idVendor:04x}:{self.idProduct:04x}")
+        return self.backend
 
     def __iter__(self):
         return iter(self._configurations)
@@ -111,12 +147,28 @@ class FakeDevice:
     def detach_kernel_driver(self, interface_number):
         pass
 
+    def clear_halt(self, endpoint):
+        self.last_clear_halt_call = {"endpoint": endpoint}
+
 
 class FakeUsbUtil:
+    ENDPOINT_IN = 0x80
+    ENDPOINT_OUT = 0x00
+    ENDPOINT_TYPE_CTRL = 0
+    ENDPOINT_TYPE_ISO = 1
+    ENDPOINT_TYPE_BULK = 2
+    ENDPOINT_TYPE_INTR = 3
+
     STRINGS = {1: "Acme Corp", 2: "Acme Widget", 3: "SN-0001"}
 
     def get_string(self, dev, index):
         return self.STRINGS.get(index)
+
+    def endpoint_direction(self, address):
+        return self.ENDPOINT_IN if (address & 0x80) else self.ENDPOINT_OUT
+
+    def endpoint_type(self, attributes):
+        return attributes & 0x03
 
     def claim_interface(self, dev, interface):
         dev.claimed_by_util = getattr(dev, "claimed_by_util", set())
@@ -331,23 +383,27 @@ def test_bulkTransferIn_adds_the_in_direction_bit():
     対照として、transferOut/bulkTransferOutは元々ビット無しのendpointNumberが
     そのまま正しいbEndpointAddressになる(OUT方向は0ビット)ため変換は不要であり、
     そちらは今回変更していないことも合わせて確認する。"""
-    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [])])
+    ep_in = FakeEndpoint(0x81, 0x02)   # endpoint 1, IN, bulk
+    ep_out = FakeEndpoint(0x02, 0x02)  # endpoint 2, OUT, bulk
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [ep_in, ep_out])
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [intf])])
     bridge = make_bridge([dev_a])
     bridge._is_granted = lambda *a, **kw: True  # このテストの対象はopenDeviceの許可ゲートではない
 
     open_result = json.loads(bridge.openDevice(0x2341, 0x8036))
     assert open_result["success"] is True
     handle = open_result["handle"]
+    assert json.loads(bridge.claimInterface(handle, 0))["success"] is True
 
     in_result = json.loads(bridge.bulkTransferIn(handle, 1, 4))
-    assert in_result["success"] is True
+    assert in_result["success"] is True, in_result
     assert dev_a.last_read_call["endpoint"] == 0x81, (
         "endpointNumber=1のIN転送はbEndpointAddress=0x81(=1 | 0x80)をpyusbへ渡すべき"
         f"だが、実際には {dev_a.last_read_call['endpoint']:#x} だった"
     )
 
     out_result = json.loads(bridge.bulkTransferOut(handle, 2, "01020304"))
-    assert out_result["success"] is True
+    assert out_result["success"] is True, out_result
     assert dev_a.last_write_call["endpoint"] == 2, (
         "OUT方向は方向ビットが無いのが正しいので、endpointNumberはそのまま2で渡るはず"
     )
@@ -432,6 +488,161 @@ def test_control_transfer_standard_request_restrictions():
     print("test_control_transfer_standard_request_restrictions: OK")
 
 
+def test_bulk_transfer_and_clearHalt_require_claimed_interface():
+    """実Chrome(Blinkの USBDevice::EnsureEndpointAvailable(), 実際に取得して確認)は
+    transferIn/transferOut/clearHaltの前に、対象endpointが「claim済みの
+    interfaceに属している」ことを毎回検証する。旧実装はcontrolTransferIn/Outにしか
+    この種の検証を入れておらず、bulkTransferIn/Out・clearHaltは対象デバイスが
+    開いてさえいればclaimInterface()を一度も呼ばずに実機へ転送を投げられて
+    しまっていた(保護対象クラスのインターフェースへも、controlTransferを介さず
+    直接bulk/interruptで読み書きできてしまう抜け穴だった)。"""
+    ep_in = FakeEndpoint(0x81, 0x02)
+    ep_out = FakeEndpoint(0x02, 0x02)
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [ep_in, ep_out])
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [intf])])
+    bridge = make_bridge([dev_a])
+    bridge._is_granted = lambda *a, **kw: True
+    handle = json.loads(bridge.openDevice(0x2341, 0x8036))["handle"]
+
+    # claimInterface()を一度も呼んでいない状態
+    in_before = json.loads(bridge.bulkTransferIn(handle, 1, 4))
+    assert in_before["success"] is False
+    assert in_before["error"].startswith("NotFoundError:"), in_before
+
+    out_before = json.loads(bridge.bulkTransferOut(handle, 2, "01"))
+    assert out_before["success"] is False
+    assert out_before["error"].startswith("NotFoundError:"), out_before
+
+    halt_before = json.loads(bridge.clearHalt(handle, "in", 1))
+    assert halt_before["success"] is False
+    assert halt_before["error"].startswith("NotFoundError:"), halt_before
+
+    assert not hasattr(dev_a, "last_read_call")
+    assert not hasattr(dev_a, "last_write_call")
+
+    # claimInterface()後は全て通る
+    assert json.loads(bridge.claimInterface(handle, 0))["success"] is True
+    assert json.loads(bridge.bulkTransferIn(handle, 1, 4))["success"] is True
+    assert json.loads(bridge.bulkTransferOut(handle, 2, "01"))["success"] is True
+    assert json.loads(bridge.clearHalt(handle, "in", 1))["success"] is True
+    print("test_bulk_transfer_and_clearHalt_require_claimed_interface: OK")
+
+
+def test_bulk_transfer_rejects_out_of_range_endpoint_number():
+    """実Chromeは endpoint番号が 1-15 の範囲外(0または16以上)だと
+    IndexSizeErrorで即座に拒否する(EnsureEndpointAvailable())。"""
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [FakeEndpoint(0x81, 0x02)])
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [intf])])
+    bridge = make_bridge([dev_a])
+    bridge._is_granted = lambda *a, **kw: True
+    handle = json.loads(bridge.openDevice(0x2341, 0x8036))["handle"]
+    assert json.loads(bridge.claimInterface(handle, 0))["success"] is True
+
+    zero_result = json.loads(bridge.bulkTransferIn(handle, 0, 4))
+    assert zero_result["success"] is False
+    assert zero_result["error"].startswith("IndexSizeError:"), zero_result
+
+    too_big_result = json.loads(bridge.bulkTransferIn(handle, 16, 4))
+    assert too_big_result["success"] is False
+    assert too_big_result["error"].startswith("IndexSizeError:"), too_big_result
+    print("test_bulk_transfer_rejects_out_of_range_endpoint_number: OK")
+
+
+def test_isochronousTransfer_without_iso_backend_returns_not_supported():
+    """pyusbの公開API(usb.core.Device)にはisochronous転送メソッドが無く、
+    このブリッジはlibusb1バックエンドの内部API(iso_read/iso_write)へ
+    dev._ctx.handle経由でアクセスするワークアラウンドに頼っている。
+    それが利用できない環境(backend=None、非libusb1バックエンド等)では、
+    例外を投げず、はっきりしたNotSupportedErrorへ安全にフォールバックする
+    べきことを確認する。"""
+    ep_iso_in = FakeEndpoint(0x83, 0x01)  # endpoint 3, IN, isochronous
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [ep_iso_in])
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [intf])])  # backend=None(既定)
+    bridge = make_bridge([dev_a])
+    bridge._is_granted = lambda *a, **kw: True
+    handle = json.loads(bridge.openDevice(0x2341, 0x8036))["handle"]
+    assert json.loads(bridge.claimInterface(handle, 0))["success"] is True
+
+    result = json.loads(bridge.isochronousTransferIn(handle, 3, json.dumps([32, 32])))
+    assert result["success"] is False
+    assert result["error"].startswith("NotSupportedError:"), result
+    print("test_isochronousTransfer_without_iso_backend_returns_not_supported: OK")
+
+
+def test_isochronousTransfer_rejects_non_uniform_packet_lengths():
+    """pyusbのiso_read/iso_writeは(libusb_get_max_iso_packet_size()から求めた)
+    均一なパケット長でしかバッファを分割できないため、packetLengthsの要素が
+    全て同じでない場合はNotSupportedErrorにする(誤った長さ・誤った分割で
+    黙って実機へ投げるよりはるかに安全)。"""
+    ep_iso_in = FakeEndpoint(0x83, 0x01)
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [ep_iso_in])
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [intf])])
+    dev_a.enable_fake_iso_backend()
+    bridge = make_bridge([dev_a])
+    bridge._is_granted = lambda *a, **kw: True
+    handle = json.loads(bridge.openDevice(0x2341, 0x8036))["handle"]
+    assert json.loads(bridge.claimInterface(handle, 0))["success"] is True
+
+    result = json.loads(bridge.isochronousTransferIn(handle, 3, json.dumps([16, 32])))
+    assert result["success"] is False
+    assert result["error"].startswith("NotSupportedError:"), result
+    print("test_isochronousTransfer_rejects_non_uniform_packet_lengths: OK")
+
+
+def test_isochronousTransfer_requires_claimed_isochronous_endpoint():
+    """endpointが(1)claim済みインターフェースに属していない、または
+    (2)見つかってもisochronousタイプでない場合は、実転送を試みる前に
+    (NotFoundError/InvalidAccessErrorで)拒否する。"""
+    ep_bulk = FakeEndpoint(0x81, 0x02)    # endpoint 1, IN, bulk(isochronousではない)
+    ep_iso_in = FakeEndpoint(0x83, 0x01)  # endpoint 3, IN, isochronous
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [ep_bulk, ep_iso_in])
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [intf])])
+    dev_a.enable_fake_iso_backend()
+    bridge = make_bridge([dev_a])
+    bridge._is_granted = lambda *a, **kw: True
+    handle = json.loads(bridge.openDevice(0x2341, 0x8036))["handle"]
+
+    not_claimed = json.loads(bridge.isochronousTransferIn(handle, 3, json.dumps([32])))
+    assert not_claimed["success"] is False
+    assert not_claimed["error"].startswith("NotFoundError:"), not_claimed
+
+    assert json.loads(bridge.claimInterface(handle, 0))["success"] is True
+
+    wrong_type = json.loads(bridge.isochronousTransferIn(handle, 1, json.dumps([32])))
+    assert wrong_type["success"] is False
+    assert wrong_type["error"].startswith("InvalidAccessError:"), wrong_type
+    print("test_isochronousTransfer_requires_claimed_isochronous_endpoint: OK")
+
+
+def test_isochronousTransfer_success_path_with_fake_backend():
+    """フェイクのiso backendを使い、方向ビットの付与・パケット分割・戻り値の
+    組み立てが正しく行われることを確認する。
+    ⚠️ 実USBハードウェアが無いため、実機相手のisochronous転送そのものは
+    このテストでは検証できていない(検証できているのはPython側のロジックのみ)。"""
+    ep_iso_in = FakeEndpoint(0x83, 0x01)   # endpoint 3, IN
+    ep_iso_out = FakeEndpoint(0x04, 0x01)  # endpoint 4, OUT
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [ep_iso_in, ep_iso_out])
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [intf])])
+    fake_backend = dev_a.enable_fake_iso_backend()
+    bridge = make_bridge([dev_a])
+    bridge._is_granted = lambda *a, **kw: True
+    handle = json.loads(bridge.openDevice(0x2341, 0x8036))["handle"]
+    assert json.loads(bridge.claimInterface(handle, 0))["success"] is True
+
+    in_result = json.loads(bridge.isochronousTransferIn(handle, 3, json.dumps([4, 4])))
+    assert in_result["success"] is True, in_result
+    assert len(in_result["packets"]) == 2
+    assert all(p["status"] == "ok" for p in in_result["packets"])
+    assert fake_backend.iso_read_calls[-1]["ep"] == 0x83, "IN方向ビット(0x80)込みのアドレスで呼ぶべき"
+
+    out_result = json.loads(bridge.isochronousTransferOut(handle, 4, "0102030405060708", json.dumps([4, 4])))
+    assert out_result["success"] is True, out_result
+    assert len(out_result["packets"]) == 2
+    assert fake_backend.iso_write_calls[-1]["ep"] == 4
+    assert fake_backend.iso_write_calls[-1]["data"] == bytes.fromhex("0102030405060708")
+    print("test_isochronousTransfer_success_path_with_fake_backend: OK")
+
+
 def test_requestDeviceChooser_reentrancy_guard(monkeypatch):
     """dlg.exec()は(実物のQtでは)ネストしたQtイベントループを回すため、その最中に
     同じWebUSBBridgeインスタンスへもう一度requestDeviceChooser()が呼ばれると、
@@ -510,6 +721,13 @@ def test_requestDeviceChooser_is_registered_as_qt_slot():
         "_control_transfer_validation_error must remain a private helper, not a "
         "JS-reachable @Slot"
     )
+    assert "_endpoint_available_or_error" not in slot_names, (
+        "_endpoint_available_or_error must remain a private helper, not a "
+        "JS-reachable @Slot"
+    )
+    assert "_iso_backend_or_error" not in slot_names and "_validate_packet_lengths" not in slot_names, (
+        "isochronous transfer helpers must remain private, not JS-reachable @Slots"
+    )
     print("test_requestDeviceChooser_is_registered_as_qt_slot: OK")
 
 
@@ -536,6 +754,12 @@ if __name__ == "__main__":
     test_control_transfer_class_request_to_protected_interface_is_blocked()
     test_control_transfer_interface_recipient_requires_claim()
     test_control_transfer_standard_request_restrictions()
+    test_bulk_transfer_and_clearHalt_require_claimed_interface()
+    test_bulk_transfer_rejects_out_of_range_endpoint_number()
+    test_isochronousTransfer_without_iso_backend_returns_not_supported()
+    test_isochronousTransfer_rejects_non_uniform_packet_lengths()
+    test_isochronousTransfer_requires_claimed_isochronous_endpoint()
+    test_isochronousTransfer_success_path_with_fake_backend()
     test_requestDeviceChooser_reentrancy_guard(mp)
     test_requestDeviceChooser_is_registered_as_qt_slot()
     print("ALL BRIDGE TESTS PASSED")

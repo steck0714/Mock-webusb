@@ -702,6 +702,95 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
+    def _endpoint_available_or_error(self, handle_id, dev, in_transfer, endpoint_number, required_type=None):
+        """実Chromeの USBDevice::EnsureEndpointAvailable()
+        (third_party/blink/renderer/modules/webusb/usb_device.cc を実際に取得して
+        確認)が transferIn/transferOut/clearHalt の前に必ず要求する事前条件:
+        対象endpointは「claim済みかつ選択中のalternate settingに属する」
+        interfaceの一部でなければならない。
+        🛡️ 旧実装はcontrolTransferIn/Outにしかこの種の検証を入れておらず、
+        bulkTransferIn/Out・clearHaltは対象ハンドルが開いてさえいれば無条件で
+        実機へ転送を投げていた。つまりclaimInterface()を一度も呼ばず(=保護対象
+        クラスの拒否を経由せず)に、保護対象インターフェースのbulk/interrupt
+        endpointへ直接データを読み書きできてしまう抜け穴だった。
+        endpoint_numberは方向ビットを含まない生の番号(spec/実Chrome: 1-15、
+        0と16以上はIndexSizeError)。in_transfer=Trueならreadに使うin方向の
+        endpoint、Falseならwriteに使うout方向のendpointを探す(同じ番号でも
+        IN用とOUT用は別の記述子なので、Chrome同様に方向まで一致させる)。
+        「選択中のalternate setting」までは追跡しておらず、claim済み
+        インターフェースの持つ全alternateを対象に探索する簡略化をしている
+        (ほとんどの実機はinterfaceあたりalternateが1つしかないため実害は小さく、
+        より許容的になる方向の簡略化なので安全側からは外れない)。
+        required_type: 指定した場合、見つかったendpointの実際の転送タイプ
+        ("bulk"/"interrupt"/"isochronous")がこれと一致しないと
+        InvalidAccessErrorにする(spec: isochronousTransferIn/Outが要求する
+        「endpoint.typeがisochronousでなければInvalidAccessError」相当)。
+        妥当なら (None, 見つかったInterface番号)、そうでなければ
+        (json.dumps済みのエラーレスポンス文字列, None) を返す。"""
+        if not (1 <= endpoint_number <= 15):
+            return json.dumps({
+                "success": False,
+                "error": f"IndexSizeError: endpoint number {endpoint_number} is out of range (must be 1-15)",
+            }), None
+        info = self._open_devices.get(handle_id) or {}
+        claimed = info.get("claimed_interfaces", set())
+        try:
+            active_cfg = dev.get_active_configuration()
+        except Exception:
+            return json.dumps({
+                "success": False,
+                "error": "InvalidStateError: the device must have a configuration selected",
+            }), None
+
+        owner_number = None
+        found_ep = None
+        try:
+            for intf in active_cfg:
+                for ep in intf:
+                    addr = getattr(ep, "bEndpointAddress", None)
+                    if addr is None or (addr & 0x0F) != endpoint_number:
+                        continue
+                    if bool(addr & 0x80) != bool(in_transfer):
+                        continue
+                    owner_number, found_ep = intf.bInterfaceNumber, ep
+                    raise StopIteration
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+
+        if owner_number is None or owner_number not in claimed:
+            direction_word = "IN" if in_transfer else "OUT"
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"NotFoundError: {direction_word} endpoint {endpoint_number} is not part "
+                    "of a claimed and selected alternate interface"
+                ),
+            }), None
+
+        if required_type is not None:
+            try:
+                _usb_core, usb_util = self._pyusb()
+                ep_type = usb_util.endpoint_type(found_ep.bmAttributes)
+                type_name = {
+                    usb_util.ENDPOINT_TYPE_BULK: "bulk",
+                    usb_util.ENDPOINT_TYPE_INTR: "interrupt",
+                    usb_util.ENDPOINT_TYPE_ISO: "isochronous",
+                }.get(ep_type, "unknown")
+            except Exception:
+                type_name = "unknown"
+            if type_name != required_type:
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"InvalidAccessError: endpoint {endpoint_number} is a {type_name} "
+                        f"endpoint, not {required_type}"
+                    ),
+                }), None
+
+        return None, owner_number
+
     @Slot(int, str, int, result=str)
     def clearHalt(self, handle_id, direction, endpoint_number):
         """USBDevice.clearHalt(direction, endpointNumber) 相当。
@@ -710,6 +799,11 @@ class WebUSBBridge(QObject):
             dev = self._get_open_device(handle_id)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
+            validation_error, _owner = self._endpoint_available_or_error(
+                handle_id, dev, direction == "in", endpoint_number
+            )
+            if validation_error is not None:
+                return validation_error
             _usb_core, usb_util = self._pyusb()
             address = endpoint_number | (0x80 if direction == "in" else 0x00)
             dev.clear_halt(address)
@@ -731,6 +825,9 @@ class WebUSBBridge(QObject):
             dev = self._get_open_device(handle_id)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
+            validation_error, _owner = self._endpoint_available_or_error(handle_id, dev, True, endpoint)
+            if validation_error is not None:
+                return validation_error
             endpoint_address = endpoint | 0x80
             try:
                 data = dev.read(endpoint_address, length, timeout=5000)
@@ -752,6 +849,9 @@ class WebUSBBridge(QObject):
             dev = self._get_open_device(handle_id)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
+            validation_error, _owner = self._endpoint_available_or_error(handle_id, dev, False, endpoint)
+            if validation_error is not None:
+                return validation_error
             try:
                 written = dev.write(endpoint, bytes.fromhex(data_hex), timeout=5000)
             except Exception as e:
@@ -925,18 +1025,166 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    # --- isochronous転送: 明示的に非対応とする ---
-    # WebUSB仕様には存在するが、OS横断で確実に動くisochronous実装は難易度が高く、
-    # 参照実装であるnode-usb(旧thegecko/webusb後継)自身も「現状未対応」としている。
-    # 何もしない/沈黙して失敗するより、呼び出し元が確実にフォールバック処理へ
-    # 分岐できるよう、はっきりしたNotSupportedErrorを返す。
+    def _iso_backend_or_error(self, dev):
+        """isochronous転送に使う低レベルbackend/デバイスハンドルを取得する。
+        🛡️ 重要な注意: pyusbの公開API(usb.core.Device)にはisochronous転送用の
+        メソッドが無い(read()/write()はbulk/interrupt専用、と公式ドキュメントに
+        明記されている)。一方、libusb1バックエンド自体は iso_read()/iso_write()
+        という低レベルAPIを持っており、これがpyusbコミュニティで知られている
+        事実上唯一のワークアラウンドだが、使うには dev._ctx.handle という
+        pyusbの非公開の内部属性へ直接アクセスする必要がある。
+        これはこのプロジェクトの他の全実装が守っている「pyusbの公開APIのみに
+        依存する」という原則から外れる、この機能固有の例外。
+        pyusbのバージョンが変わって内部構造が変化した場合や、libusb1以外の
+        バックエンド(古いWindows環境のlibusb0/OpenUSB等)が使われている場合は、
+        例外を投げず素直にNotSupportedErrorの文字列を返す
+        (黙って間違った動作をするより、対応できないことを呼び出し元に伝える)。
+        妥当なら (backend, dev_handle) のタプル、そうでなければ
+        json.dumps済みのエラーレスポンス文字列を返す。"""
+        try:
+            backend = dev.backend
+            dev_handle = dev._ctx.handle
+            if backend is None or dev_handle is None:
+                raise AttributeError("backend or device handle not available")
+            if not (hasattr(backend, "iso_read") and hasattr(backend, "iso_write")):
+                raise AttributeError("backend has no iso_read/iso_write")
+        except Exception:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "NotSupportedError: isochronous transfers require pyusb's libusb1 "
+                    "backend with an open device handle, which is not available in this "
+                    "environment"
+                ),
+            })
+        return backend, dev_handle
+
+    @staticmethod
+    def _validate_packet_lengths(packet_lengths_json):
+        """packetLengthsの妥当性検証と、pyusbのiso_read/iso_writeが要求する
+        「全パケット同じ長さ」制約のチェック。
+        🛡️ 既知の制約: pyusbのlibusb1バックエンドは、渡した1本のバッファを
+        libusb_get_max_iso_packet_size()から求めた"均一な"パケット長で機械的に
+        分割する実装になっており(最後の1個だけ端数を許容)、spec本文が許す
+        「パケットごとに異なる長さ」を表現する手段が無い。このため、渡された
+        packetLengthsが全て同じ長さの場合のみ対応し、そうでない場合は
+        NotSupportedErrorを返す(誤った長さで黙って動くよりはるかに安全)。
+        妥当なら (packet_lengths, None)、そうでなければ (None, エラーレスポンス文字列)。"""
+        try:
+            packet_lengths = json.loads(packet_lengths_json) if packet_lengths_json else []
+        except Exception:
+            return None, json.dumps({"success": False, "error": "TypeError: packetLengths must be a JSON array"})
+        if not isinstance(packet_lengths, list) or not packet_lengths:
+            return None, json.dumps({"success": False, "error": "TypeError: packetLengths must be a non-empty array"})
+        if any((not isinstance(n, int)) or isinstance(n, bool) or n < 0 for n in packet_lengths):
+            return None, json.dumps({"success": False, "error": "TypeError: packetLengths must contain non-negative integers"})
+        if len(set(packet_lengths)) > 1:
+            return None, json.dumps({
+                "success": False,
+                "error": (
+                    "NotSupportedError: this bridge only supports isochronous transfers "
+                    "with uniform packet lengths (pyusb's isochronous backend doesn't "
+                    "expose arbitrary per-packet lengths)"
+                ),
+            })
+        return packet_lengths, None
+
+    # --- isochronous転送 ---
+    # ⚠️ 実機での動作は未検証: このサンドボックスには実USBハードウェアが存在せず、
+    #    ここから先(iso_read/iso_writeの実呼び出し)は自動テストでも実機相手には
+    #    検証できていない。フォールバック経路(バックエンド非対応・packetLengths
+    #    不正)とパケット分割の算術だけはテスト済み。実配線での検証は別途必要。
     @Slot(int, int, str, result=str)
     def isochronousTransferIn(self, handle_id, endpoint, packet_lengths_json):
-        return json.dumps({"success": False, "error": "NotSupportedError: isochronous transfers are not supported by this WebUSB bridge"})
+        """USBDevice.isochronousTransferIn(endpointNumber, packetLengths) 相当。"""
+        try:
+            packet_lengths, error = self._validate_packet_lengths(packet_lengths_json)
+            if error is not None:
+                return error
+            packet_length = packet_lengths[0]
+            total_length = packet_length * len(packet_lengths)
+
+            dev = self._get_open_device(handle_id)
+            if dev is None:
+                return json.dumps({"success": False, "error": "Invalid device handle"})
+            validation_error, _owner = self._endpoint_available_or_error(
+                handle_id, dev, True, endpoint, required_type="isochronous"
+            )
+            if validation_error is not None:
+                return validation_error
+
+            iso = self._iso_backend_or_error(dev)
+            if isinstance(iso, str):
+                return iso
+            backend, dev_handle = iso
+
+            import array
+            buff = array.array("B", bytes(total_length))
+            endpoint_address = endpoint | 0x80
+            try:
+                transferred = backend.iso_read(dev_handle, endpoint_address, endpoint, buff, timeout=5000)
+            except Exception as e:
+                if is_stall_error(e):
+                    # 個々のパケット単位でstall/ok を区別する手段がpyusb越しには無いため、
+                    # 安全側に倒して全パケットstall扱いにする。
+                    packets = [{"status": "stall", "data": ""} for _ in packet_lengths]
+                    return json.dumps({"success": True, "packets": packets})
+                raise
+
+            received = bytes(buff)[:max(int(transferred), 0)]
+            packets = []
+            offset = 0
+            for _ in packet_lengths:
+                chunk = received[offset:offset + packet_length]
+                offset += packet_length
+                packets.append({"status": "ok", "data": chunk.hex()})
+            return json.dumps({"success": True, "packets": packets})
+        except Exception as e:
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     @Slot(int, int, str, str, result=str)
     def isochronousTransferOut(self, handle_id, endpoint, data_hex, packet_lengths_json):
-        return json.dumps({"success": False, "error": "NotSupportedError: isochronous transfers are not supported by this WebUSB bridge"})
+        """USBDevice.isochronousTransferOut(endpointNumber, data, packetLengths) 相当。"""
+        try:
+            packet_lengths, error = self._validate_packet_lengths(packet_lengths_json)
+            if error is not None:
+                return error
+            packet_length = packet_lengths[0]
+
+            dev = self._get_open_device(handle_id)
+            if dev is None:
+                return json.dumps({"success": False, "error": "Invalid device handle"})
+            validation_error, _owner = self._endpoint_available_or_error(
+                handle_id, dev, False, endpoint, required_type="isochronous"
+            )
+            if validation_error is not None:
+                return validation_error
+
+            iso = self._iso_backend_or_error(dev)
+            if isinstance(iso, str):
+                return iso
+            backend, dev_handle = iso
+
+            import array
+            data = bytes.fromhex(data_hex)
+            buff = array.array("B", data)
+            try:
+                transferred = backend.iso_write(dev_handle, endpoint, endpoint, buff, timeout=5000)
+            except Exception as e:
+                if is_stall_error(e):
+                    packets = [{"status": "stall", "bytesWritten": 0} for _ in packet_lengths]
+                    return json.dumps({"success": True, "packets": packets})
+                raise
+
+            remaining = max(int(transferred), 0)
+            packets = []
+            for _ in packet_lengths:
+                written = min(packet_length, remaining)
+                remaining -= written
+                packets.append({"status": "ok", "bytesWritten": written})
+            return json.dumps({"success": True, "packets": packets})
+        except Exception as e:
+            return json.dumps({"success": False, "error": safe_error_str(e)})
 
     # --- オリジン権限の管理 ---
     @Slot(int, int, result=str)

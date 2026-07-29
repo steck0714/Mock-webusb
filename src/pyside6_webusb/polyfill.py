@@ -328,11 +328,81 @@ WEBUSB_POLYFILL_JS = r"""
             return { status: res.status || 'ok', bytesWritten: res.bytesWritten };
         });
     };
-    OpenWebUSBDevice.prototype.isochronousTransferIn = function() {
-        return Promise.reject(new DOMException('isochronous transfers are not supported by this WebUSB bridge', 'NotSupportedError'));
+    // 🛡️ spec: isochronousTransferIn/Outはどちらも「対象endpointを探し、
+    //    見つからなければNotFoundError、typeがisochronousでなければ
+    //    InvalidAccessError」という事前チェックを実機へ問い合わせる前に行う
+    //    (USBDevice.isochronousTransferIn(endpointNumber, packetLengths)の
+    //    アルゴリズム手順4-6相当)。claim済みのalternateだけを対象にする
+    //    (未claimのインターフェースのendpointはそもそも見つからない扱い)。
+    function _findClaimedEndpoint(device, endpointNumber, direction) {
+        var cfg = device.configuration;
+        if (!cfg) return null;
+        var interfaces = cfg.interfaces || [];
+        for (var i = 0; i < interfaces.length; i++) {
+            var iface = interfaces[i];
+            if (!iface.claimed) continue;
+            var alternates = iface.alternates || [];
+            for (var j = 0; j < alternates.length; j++) {
+                var endpoints = alternates[j].endpoints || [];
+                for (var k = 0; k < endpoints.length; k++) {
+                    var ep = endpoints[k];
+                    if (ep.endpointNumber === endpointNumber && ep.direction === direction) {
+                        return ep;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    OpenWebUSBDevice.prototype.isochronousTransferIn = function(endpointNumber, packetLengths) {
+        var ep = _findClaimedEndpoint(this, endpointNumber, 'in');
+        if (!ep) {
+            return Promise.reject(new DOMException(
+                'The specified endpoint is not part of a claimed and selected alternate interface.',
+                'NotFoundError'));
+        }
+        if (ep.type !== 'isochronous') {
+            return Promise.reject(new DOMException(
+                'The specified endpoint is not an isochronous endpoint.', 'InvalidAccessError'));
+        }
+        return callBridge('isochronousTransferIn', this._handle, endpointNumber, JSON.stringify(packetLengths))
+            .then(function(res) {
+                if (!res.success) throwFromResult(res, 'Isochronous transfer failed');
+                var totalLength = 0;
+                var packetBytes = (res.packets || []).map(function(p) {
+                    var b = hexToUint8(p.data || '');
+                    totalLength += b.length;
+                    return b;
+                });
+                var combined = new Uint8Array(totalLength);
+                var offset = 0;
+                var packets = packetBytes.map(function(b, i) {
+                    combined.set(b, offset);
+                    var view = new DataView(combined.buffer, offset, b.length);
+                    offset += b.length;
+                    return { data: view, status: (res.packets[i] && res.packets[i].status) || 'ok' };
+                });
+                return { data: new DataView(combined.buffer), packets: packets };
+            });
     };
-    OpenWebUSBDevice.prototype.isochronousTransferOut = function() {
-        return Promise.reject(new DOMException('isochronous transfers are not supported by this WebUSB bridge', 'NotSupportedError'));
+    OpenWebUSBDevice.prototype.isochronousTransferOut = function(endpointNumber, data, packetLengths) {
+        var ep = _findClaimedEndpoint(this, endpointNumber, 'out');
+        if (!ep) {
+            return Promise.reject(new DOMException(
+                'The specified endpoint is not part of a claimed and selected alternate interface.',
+                'NotFoundError'));
+        }
+        if (ep.type !== 'isochronous') {
+            return Promise.reject(new DOMException(
+                'The specified endpoint is not an isochronous endpoint.', 'InvalidAccessError'));
+        }
+        var hex = bytesToHex(data);
+        return callBridge('isochronousTransferOut', this._handle, endpointNumber, hex, JSON.stringify(packetLengths))
+            .then(function(res) {
+                if (!res.success) throwFromResult(res, 'Isochronous transfer failed');
+                return { packets: res.packets || [] };
+            });
     };
     OpenWebUSBDevice.prototype.controlTransferIn = function(setup, length) {
         var reqType = (setup.requestType === 'standard' ? 0x00 : setup.requestType === 'class' ? 0x20 : 0x40) |

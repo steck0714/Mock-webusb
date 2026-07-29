@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<!--
+  pyside6-webusb 互換性テストページ
+  ================================
+  実際のUSBハードウェアを繋いだ状態で examples/minimal_browser.py (または
+  install()済みの自作アプリ)からこのファイルを file:// で開き、各ボタンを
+  順に押して navigator.usb の一通りの機能が「本物のChromeのWebUSB対応サイト」
+  と同じように動くかどうかを目視で確認するためのページです。
+
+  これは自動テストの代わりではありません(pytest/node側の自動テストは
+  フェイクデバイスに対するロジック検証で、実機・実GUIでの動作そのものは
+  検証していません)。逆に、これは実機が無いと意味を持たないテストです。
+
+  使い方:
+    1. 手元にWebUSB対応の実機(Arduino/micro:bit/自作ファームウェア等)を用意する
+    2. install()済みのPySide6アプリでこのHTMLファイルを開く
+    3. 上から順にボタンを押し、ログと[OK]/[NG]表示を確認する
+    4. 気になる項目があれば、実際のChromeで同じ操作をして結果を比較する
+       (chrome://usb-internals や本物のWebUSBデモサイトも参考になります)
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>pyside6-webusb 互換性テスト</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  section { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  section h2 { margin-top: 0; font-size: 1rem; }
+  button { margin: 0.2rem 0.3rem 0.2rem 0; padding: 0.4rem 0.8rem; cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: 0.5; }
+  .status { font-weight: bold; margin-left: 0.5rem; }
+  .status.ok { color: #0a7d29; }
+  .status.ng { color: #c0392b; }
+  .status.pending { color: #b8860b; }
+  #log { background: #111; color: #d0d0d0; font-family: ui-monospace, monospace; font-size: 0.82rem;
+         padding: 0.8rem; height: 260px; overflow-y: auto; border-radius: 6px; white-space: pre-wrap; }
+  #deviceInfo { font-family: ui-monospace, monospace; font-size: 0.82rem; white-space: pre-wrap; }
+  .support-check { font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<h1>pyside6-webusb 互換性テストページ</h1>
+<p class="support-check">
+  <code>navigator.usb</code> サポート:
+  <span id="supportStatus" class="status pending">確認中…</span>
+</p>
+
+<section>
+  <h2>1. デバイス選択・情報取得</h2>
+  <button id="btnRequestDevice">requestDevice()</button>
+  <button id="btnGetDevices">getDevices()</button>
+  <span id="statusSelect" class="status"></span>
+  <pre id="deviceInfo">(まだデバイスが選択されていません)</pre>
+</section>
+
+<section>
+  <h2>2. open / configuration / interface</h2>
+  <button id="btnOpen" disabled>open()</button>
+  <button id="btnSelectConfig" disabled>selectConfiguration(1)</button>
+  <button id="btnClaim" disabled>claimInterface(0)</button>
+  <button id="btnRelease" disabled>releaseInterface(0)</button>
+  <button id="btnClose" disabled>close()</button>
+  <span id="statusOpen" class="status"></span>
+</section>
+
+<section>
+  <h2>3. 転送(要: interface 0 をclaim済み、endpoint番号は環境に合わせて書き換え可)</h2>
+  <p>
+    endpoint番号:
+    <input id="epNumber" type="number" value="1" min="1" max="15" style="width:4em">
+    length/data(hex):
+    <input id="epData" type="text" value="01020304" style="width:10em">
+  </p>
+  <button id="btnBulkIn" disabled>transferIn (bulk/interrupt)</button>
+  <button id="btnBulkOut" disabled>transferOut (bulk/interrupt)</button>
+  <button id="btnControlIn" disabled>controlTransferIn (GET_STATUS)</button>
+  <button id="btnClearHalt" disabled>clearHalt('in', N)</button>
+  <span id="statusTransfer" class="status"></span>
+</section>
+
+<section>
+  <h2>4. connect / disconnect イベント</h2>
+  <p>この状態でUSBケーブルを抜き差しすると、下のログに connect/disconnect が出るはずです。</p>
+  <span id="statusEvents" class="status pending">待機中(抜き差ししてください)</span>
+</section>
+
+<section>
+  <h2>5. forget()</h2>
+  <button id="btnForget" disabled>device.forget()</button>
+  <span id="statusForget" class="status"></span>
+</section>
+
+<h2>ログ</h2>
+<div id="log"></div>
+
+<script>
+let device = null;
+const logEl = document.getElementById('log');
+function log(msg, isError) {
+    const line = document.createElement('div');
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    if (isError) line.style.color = '#ff6b6b';
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(id, ok, text) {
+    const el = document.getElementById(id);
+    el.textContent = text || (ok ? 'OK' : 'NG');
+    el.className = 'status ' + (ok ? 'ok' : 'ng');
+}
+function enable(...ids) { ids.forEach(id => document.getElementById(id).disabled = false); }
+function disable(...ids) { ids.forEach(id => document.getElementById(id).disabled = true); }
+
+// --- サポート確認 ---
+if (navigator.usb) {
+    setStatus('supportStatus', true, 'あり (navigator.usb が存在します)');
+    log('navigator.usb を検出しました。');
+} else {
+    setStatus('supportStatus', false, 'なし (navigator.usb が undefined です)');
+    log('navigator.usb が見つかりません。install()が呼ばれているか確認してください。', true);
+}
+
+function describeDevice(d) {
+    return JSON.stringify({
+        vendorId: '0x' + d.vendorId.toString(16).padStart(4, '0'),
+        productId: '0x' + d.productId.toString(16).padStart(4, '0'),
+        manufacturerName: d.manufacturerName,
+        productName: d.productName,
+        serialNumber: d.serialNumber,
+        deviceClass: d.deviceClass,
+        opened: d.opened,
+        configurations: (d.configurations || []).map(c => ({
+            configurationValue: c.configurationValue,
+            configurationName: c.configurationName,
+            interfaces: (c.interfaces || []).map(i => ({
+                interfaceNumber: i.interfaceNumber,
+                alternates: (i.alternates || []).map(a => ({
+                    interfaceClass: a.interfaceClass,
+                    interfaceName: a.interfaceName,
+                    endpoints: a.endpoints,
+                })),
+            })),
+        })),
+    }, null, 2);
+}
+
+document.getElementById('btnRequestDevice').addEventListener('click', async () => {
+    try {
+        device = await navigator.usb.requestDevice({ filters: [] });
+        document.getElementById('deviceInfo').textContent = describeDevice(device);
+        setStatus('statusSelect', true);
+        log(`requestDevice() 成功: ${device.productName || '(製品名なし)'}`);
+        enable('btnOpen');
+    } catch (e) {
+        setStatus('statusSelect', false, `${e.name}: ${e.message}`);
+        log(`requestDevice() 失敗: ${e.name}: ${e.message}`, true);
+    }
+});
+
+document.getElementById('btnGetDevices').addEventListener('click', async () => {
+    try {
+        const devices = await navigator.usb.getDevices();
+        log(`getDevices() 成功: ${devices.length}台の許可済みデバイス`);
+        if (devices.length > 0) {
+            device = devices[0];
+            document.getElementById('deviceInfo').textContent = describeDevice(device);
+            setStatus('statusSelect', true);
+            enable('btnOpen');
+        }
+    } catch (e) {
+        log(`getDevices() 失敗: ${e.name}: ${e.message}`, true);
+    }
+});
+
+document.getElementById('btnOpen').addEventListener('click', async () => {
+    try {
+        await device.open();
+        log('open() 成功');
+        setStatus('statusOpen', true, 'open済み');
+        enable('btnSelectConfig', 'btnClaim', 'btnClose', 'btnForget');
+    } catch (e) {
+        log(`open() 失敗: ${e.name}: ${e.message}`, true);
+        setStatus('statusOpen', false, `${e.name}`);
+    }
+});
+document.getElementById('btnSelectConfig').addEventListener('click', async () => {
+    try { await device.selectConfiguration(1); log('selectConfiguration(1) 成功'); }
+    catch (e) { log(`selectConfiguration(1) 失敗: ${e.name}: ${e.message}`, true); }
+});
+document.getElementById('btnClaim').addEventListener('click', async () => {
+    try {
+        await device.claimInterface(0);
+        log('claimInterface(0) 成功');
+        enable('btnRelease', 'btnBulkIn', 'btnBulkOut', 'btnControlIn', 'btnClearHalt');
+    } catch (e) { log(`claimInterface(0) 失敗: ${e.name}: ${e.message}`, true); }
+});
+document.getElementById('btnRelease').addEventListener('click', async () => {
+    try { await device.releaseInterface(0); log('releaseInterface(0) 成功'); }
+    catch (e) { log(`releaseInterface(0) 失敗: ${e.name}: ${e.message}`, true); }
+});
+document.getElementById('btnClose').addEventListener('click', async () => {
+    try {
+        await device.close();
+        log('close() 成功');
+        setStatus('statusOpen', true, 'close済み');
+        disable('btnSelectConfig', 'btnClaim', 'btnRelease', 'btnClose', 'btnForget',
+                'btnBulkIn', 'btnBulkOut', 'btnControlIn', 'btnClearHalt');
+    } catch (e) { log(`close() 失敗: ${e.name}: ${e.message}`, true); }
+});
+
+document.getElementById('btnBulkIn').addEventListener('click', async () => {
+    const ep = parseInt(document.getElementById('epNumber').value, 10);
+    try {
+        const result = await device.transferIn(ep, 64);
+        const bytes = new Uint8Array(result.data.buffer);
+        log(`transferIn(${ep}, 64) 成功: status=${result.status}, data=${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        setStatus('statusTransfer', true);
+    } catch (e) { log(`transferIn(${ep}) 失敗: ${e.name}: ${e.message}`, true); setStatus('statusTransfer', false, e.name); }
+});
+document.getElementById('btnBulkOut').addEventListener('click', async () => {
+    const ep = parseInt(document.getElementById('epNumber').value, 10);
+    const hex = document.getElementById('epData').value.trim();
+    const bytes = new Uint8Array((hex.match(/.{1,2}/g) || []).map(b => parseInt(b, 16)));
+    try {
+        const result = await device.transferOut(ep, bytes);
+        log(`transferOut(${ep}, ...) 成功: status=${result.status}, bytesWritten=${result.bytesWritten}`);
+        setStatus('statusTransfer', true);
+    } catch (e) { log(`transferOut(${ep}) 失敗: ${e.name}: ${e.message}`, true); setStatus('statusTransfer', false, e.name); }
+});
+document.getElementById('btnControlIn').addEventListener('click', async () => {
+    try {
+        // GET_STATUS(recipient=device, standard) -- ほぼ全機器が応答する無害な標準リクエスト
+        const result = await device.controlTransferIn(
+            { requestType: 'standard', recipient: 'device', request: 0x00, value: 0, index: 0 }, 2);
+        const bytes = new Uint8Array(result.data.buffer);
+        log(`controlTransferIn(GET_STATUS) 成功: ${Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        setStatus('statusTransfer', true);
+    } catch (e) { log(`controlTransferIn(GET_STATUS) 失敗: ${e.name}: ${e.message}`, true); setStatus('statusTransfer', false, e.name); }
+});
+document.getElementById('btnClearHalt').addEventListener('click', async () => {
+    const ep = parseInt(document.getElementById('epNumber').value, 10);
+    try { await device.clearHalt('in', ep); log(`clearHalt('in', ${ep}) 成功`); }
+    catch (e) { log(`clearHalt('in', ${ep}) 失敗: ${e.name}: ${e.message}`, true); }
+});
+
+document.getElementById('btnForget').addEventListener('click', async () => {
+    try {
+        await device.forget();
+        log('forget() 成功(このオリジンの許可を取り消しました)');
+        setStatus('statusForget', true);
+    } catch (e) { log(`forget() 失敗: ${e.name}: ${e.message}`, true); setStatus('statusForget', false, e.name); }
+});
+
+if (navigator.usb) {
+    navigator.usb.addEventListener('connect', (e) => {
+        log(`[event] connect: ${e.device.productName || '(製品名なし)'}`);
+        setStatus('statusEvents', true, 'connectイベントを受信しました');
+    });
+    navigator.usb.addEventListener('disconnect', (e) => {
+        log(`[event] disconnect: ${e.device.productName || '(製品名なし)'}`);
+        setStatus('statusEvents', true, 'disconnectイベントを受信しました');
+    });
+}
+</script>
+</body>
+</html>

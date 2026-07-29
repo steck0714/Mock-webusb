@@ -23,7 +23,11 @@ let fakeDevices = [{
                 alternates: [
                     { alternateSetting: 1, interfaceClass: 0xFF, interfaceSubclass: 0, interfaceProtocol: 0, endpoints: [] },
                     { alternateSetting: 0, interfaceClass: 0xFF, interfaceSubclass: 0, interfaceProtocol: 0,
-                      endpoints: [{ endpointNumber: 1, direction: 'in', type: 'bulk', packetSize: 64 }] },
+                      endpoints: [
+                          { endpointNumber: 1, direction: 'in', type: 'bulk', packetSize: 64 },
+                          { endpointNumber: 3, direction: 'in', type: 'isochronous', packetSize: 32 },
+                          { endpointNumber: 4, direction: 'out', type: 'isochronous', packetSize: 32 },
+                      ] },
                 ],
             }],
         },
@@ -37,6 +41,8 @@ let bulkTransferInResponse = { success: true, status: 'ok', data: '00' };
 let bulkTransferOutResponse = { success: true, status: 'ok', bytesWritten: 1 };
 let controlTransferInResponse = { success: true, status: 'ok', data: '00' };
 let controlTransferOutResponse = { success: true, status: 'ok', bytesWritten: 1 };
+let isochronousTransferInResponse = { success: true, packets: [{ status: 'ok', data: '0102' }, { status: 'ok', data: '0304' }] };
+let isochronousTransferOutResponse = { success: true, packets: [{ status: 'ok', bytesWritten: 2 }, { status: 'ok', bytesWritten: 2 }] };
 
 function makeSignal() {
     const handlers = [];
@@ -62,6 +68,8 @@ const fakeBridge = {
     bulkTransferOut: function(h, ep, dataHex, cb) { fakeBridgeCalls.push(['bulkTransferOut', h, ep, dataHex]); cb(JSON.stringify(bulkTransferOutResponse)); },
     controlTransferIn: function(h, rt, req, val, idx, len, cb) { fakeBridgeCalls.push(['controlTransferIn', h, rt, req, val, idx, len]); cb(JSON.stringify(controlTransferInResponse)); },
     controlTransferOut: function(h, rt, req, val, idx, dataHex, cb) { fakeBridgeCalls.push(['controlTransferOut', h, rt, req, val, idx, dataHex]); cb(JSON.stringify(controlTransferOutResponse)); },
+    isochronousTransferIn: function(h, ep, packetLengthsJson, cb) { fakeBridgeCalls.push(['isochronousTransferIn', h, ep, packetLengthsJson]); cb(JSON.stringify(isochronousTransferInResponse)); },
+    isochronousTransferOut: function(h, ep, dataHex, packetLengthsJson, cb) { fakeBridgeCalls.push(['isochronousTransferOut', h, ep, dataHex, packetLengthsJson]); cb(JSON.stringify(isochronousTransferOutResponse)); },
 };
 
 global.qt = { webChannelTransport: {} };
@@ -240,14 +248,63 @@ async function main() {
     openDeviceResponse = { success: true, handle: 1 };
     console.log('open(): blocklist rejection surfaces as SecurityError: OK');
 
-    // isochronousは明示的にNotSupportedErrorで拒否されるべき
+    // 🛡️ isochronous転送: 旧実装は常にNotSupportedErrorだったが、実装した後は
+    // spec通りの事前チェック(未claim/存在しない endpoint -> NotFoundError、
+    // isochronous以外のtype -> InvalidAccessError)と、成功時のpackets/data組み立てを
+    // 確認する。他のテストによるdev/claimInterfaceResponseの状態変化(release済み・
+    // config2に切替済み等)の影響を受けないよう、フレッシュなdeviceインスタンスを
+    // 取得して検証する。
+    claimInterfaceResponse = { success: true };
+    const isoDevices = await navigator.usb.getDevices();
+    const isoDev = isoDevices[0];
+
+    // 未claimのインターフェースのendpointは「見つからない」扱い(NotFoundError)
     try {
-        await dev.isochronousTransferIn();
+        await isoDev.isochronousTransferIn(3, [32, 32]);
         assert.fail('should have thrown');
     } catch (e) {
-        assert.strictEqual(e.name, 'NotSupportedError');
+        assert.strictEqual(e.name, 'NotFoundError', '未claimのインターフェースのendpointはNotFoundErrorのはず');
     }
-    console.log('isochronousTransferIn -> NotSupportedError: OK');
+    console.log('isochronousTransferIn on unclaimed interface -> NotFoundError: OK');
+
+    await isoDev.claimInterface(0);
+    await isoDev.selectAlternateInterface(0, 0); // endpoints定義がある方(alternateSetting=0)を選択
+
+    // claim済みだが型がisochronousでないendpoint(endpoint 1はbulk) -> InvalidAccessError
+    try {
+        await isoDev.isochronousTransferIn(1, [32]);
+        assert.fail('should have thrown');
+    } catch (e) {
+        assert.strictEqual(e.name, 'InvalidAccessError', 'isochronous以外のtypeのendpointはInvalidAccessErrorのはず');
+    }
+    console.log('isochronousTransferIn on non-isochronous endpoint -> InvalidAccessError: OK');
+
+    // 存在しないendpoint番号 -> NotFoundError
+    try {
+        await isoDev.isochronousTransferIn(9, [32]);
+        assert.fail('should have thrown');
+    } catch (e) {
+        assert.strictEqual(e.name, 'NotFoundError', '存在しないendpoint番号はNotFoundErrorのはず');
+    }
+
+    // 正常系: IN方向(endpoint 3, isochronous)
+    isochronousTransferInResponse = { success: true, packets: [{ status: 'ok', data: '0102' }, { status: 'ok', data: '030405' }] };
+    const isoInResult = await isoDev.isochronousTransferIn(3, [2, 3]);
+    assert.ok(fakeBridgeCalls.some(c => c[0] === 'isochronousTransferIn' && c[2] === 3 && c[3] === JSON.stringify([2, 3])),
+        'ブリッジへ (handle, endpointNumber, packetLengthsのJSON) が正しく渡っているはず');
+    assert.strictEqual(isoInResult.packets.length, 2, 'packetsは要求したpacketLengthsと同じ個数のはず');
+    assert.strictEqual(isoInResult.packets[0].status, 'ok');
+    assert.strictEqual(new Uint8Array(isoInResult.packets[0].data.buffer, isoInResult.packets[0].data.byteOffset, isoInResult.packets[0].data.byteLength).length, 2);
+    assert.strictEqual(isoInResult.data.byteLength, 5, '結果全体の.dataは全パケット分を結合した長さになるはず(2+3=5)');
+    console.log('isochronousTransferIn success: packets[]/combined .data が正しく組み立てられる: OK');
+
+    // 正常系: OUT方向(endpoint 4, isochronous)
+    isochronousTransferOutResponse = { success: true, packets: [{ status: 'ok', bytesWritten: 2 }, { status: 'ok', bytesWritten: 2 }] };
+    const isoOutResult = await isoDev.isochronousTransferOut(4, new Uint8Array([1, 2, 3, 4]), [2, 2]);
+    assert.ok(fakeBridgeCalls.some(c => c[0] === 'isochronousTransferOut' && c[2] === 4 && c[3] === '01020304' && c[4] === JSON.stringify([2, 2])));
+    assert.strictEqual(isoOutResult.packets.length, 2);
+    assert.strictEqual(isoOutResult.packets[0].bytesWritten, 2);
+    console.log('isochronousTransferOut success: packets[] が正しく組み立てられる: OK');
 
     // 🛡️ 転送(bulk/control)の正常系はstatus:'ok'で返る。
     bulkTransferInResponse = { success: true, status: 'ok', data: '0102ff' };

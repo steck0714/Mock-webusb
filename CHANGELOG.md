@@ -2,7 +2,62 @@
 
 All notable changes to this project are documented here.
 
-## [0.0.1a0] — WebUSB spec gap audit
+## [0.0.2]
+
+Continued the spec/Chrome-source comparison from `0.0.1a0`, this time pulling actual Chromium
+source (Blink's `usb_device.cc`, fetched live from `github.com/chromium/chromium`) rather than
+spec prose alone, plus a first attempt at isochronous transfer support.
+
+### Fixed
+- **`bulkTransferIn`/`bulkTransferOut`/`clearHalt` had no equivalent of Chrome's
+  `USBDevice::EnsureEndpointAvailable()`.** Fetched and read Blink's actual
+  `third_party/blink/renderer/modules/webusb/usb_device.cc`: `transferIn`/`transferOut`/
+  `clearHalt` all unconditionally call this before touching the device, and it requires the
+  target endpoint to belong to a **claimed** interface. This implementation had that check for
+  `controlTransferIn`/`controlTransferOut` (added in `0.0.1a0`) but never extended it to plain
+  bulk/interrupt transfers or `clearHalt` — so a page could skip `claimInterface()` (and the
+  protected-class rejection that comes with it) entirely and still read/write a protected
+  interface's bulk or interrupt endpoints directly. Added `_endpoint_available_or_error()`,
+  shared by all three methods, plus the endpoint-number range check (`1`-`15`, matching
+  Chrome's `IndexSizeError` for out-of-range numbers). Added
+  `test_bulk_transfer_and_clearHalt_require_claimed_interface` and
+  `test_bulk_transfer_rejects_out_of_range_endpoint_number`; confirmed both fail against a
+  copy with the checks removed.
+
+### Added
+- **Isochronous transfer support (`isochronousTransferIn`/`isochronousTransferOut`), best
+  effort.** These previously always returned `NotSupportedError`. `pyusb`'s public API
+  (`usb.core.Device`) has no isochronous method — `read()`/`write()` are documented as
+  bulk/interrupt only — but its `libusb1` backend does expose `iso_read()`/`iso_write()`
+  (confirmed by inspecting the installed `pyusb` package directly). Reaching them requires
+  `dev.backend` and the private `dev._ctx.handle`, which is a real departure from the
+  public-API-only approach the rest of this codebase follows, and is the reason this is
+  labeled best-effort rather than held to the same confidence bar as the rest of `0.0.1a0`.
+  Two known, deliberate limitations:
+    - `pyusb`'s `iso_read`/`iso_write` split one buffer into **uniform**-length packets
+      (`libusb_get_max_iso_packet_size()`-derived, last packet takes the remainder); the
+      spec's `packetLengths` allows a different length per packet. Non-uniform
+      `packetLengths` are rejected with `NotSupportedError` rather than silently
+      mis-transferred.
+    - If `dev.backend`/`dev._ctx.handle` aren't available (non-`libusb1` backend, or a future
+      `pyusb` version restructures these attributes), both methods fall back to
+      `NotSupportedError` instead of raising.
+    Added the endpoint-type check (`InvalidAccessError` for a non-isochronous endpoint,
+    reusing `_endpoint_available_or_error()` with a new `required_type` parameter) and
+    per-packet `status`/`data`/`bytesWritten` result shapes matching
+    `USBIsochronousInTransferResult`/`USBIsochronousOutTransferResult`. Tested: parameter
+    validation, the claimed/endpoint-type gates, and packet-splitting arithmetic against a
+    fake backend (Python `test_isochronousTransfer_*`, JS `isochronousTransferIn/Out`
+    fixture tests covering `NotFoundError`/`InvalidAccessError`/success). **Not tested: an
+    actual isochronous transfer against real hardware** — there is no USB device available in
+    this environment to verify against. Treat this specific feature as unverified until
+    someone runs it against a real isochronous device (a USB audio or webcam interface is a
+    good candidate) and reports back.
+
+### Project metadata
+- Version bumped to `0.0.2`.
+
+
 
 A line-by-line audit against the actual WebUSB spec source (`WICG/webusb`'s `index.bs`,
 fetched directly from GitHub rather than relying on recollection of the rendered page) and

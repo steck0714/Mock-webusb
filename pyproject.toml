@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyside6-webusb"
-version = "0.0.1a0"
+version = "0.0.2"
 description = "A WebUSB API implementation for PySide6/QtWebEngine apps (QWebChannel bridge + pyusb backend + JS polyfill)"
 readme = "README.md"
 license = { text = "MIT" }
