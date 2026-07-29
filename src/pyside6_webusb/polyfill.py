@@ -244,6 +244,14 @@ WEBUSB_POLYFILL_JS = r"""
         this._handle = null;
     }
     OpenWebUSBDevice.prototype.open = function() {
+        // 🛡️ 実Chrome(usb_device.ccのUSBDevice::open())を確認して判明した欠落:
+        //    「すでにopened済みなら即座に成功解決する」という冪等性が無かった。
+        //    このままだとJS側でopen()を2回呼ぶたびにPython側で新しいハンドルが
+        //    発行され続け、1回目のハンドル(claim済みインターフェースの情報を
+        //    含む)は self._handle が上書きされて二度と参照できなくなり、
+        //    Python側に開いたままのpyusbデバイスリソースとして孤立してしまう
+        //    (closeDevice()を呼ぶ手段が失われるリーク)。
+        if (this.opened) return Promise.resolve();
         var self = this;
         return callBridge('openDevice', this.vendorId, this.productId).then(function(res) {
             if (!res.success) throwFromResult(res, 'Failed to open device');

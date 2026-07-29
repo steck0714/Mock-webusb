@@ -56,7 +56,7 @@ const fakeBridge = {
         fakeBridgeCalls.push(['requestDeviceChooser', optionsJson]);
         cb(JSON.stringify({ device: fakeDevices[0] }));
     },
-    openDevice: function(vid, pid, cb) { cb(JSON.stringify(openDeviceResponse)); },
+    openDevice: function(vid, pid, cb) { fakeBridgeCalls.push(['openDevice', vid, pid]); cb(JSON.stringify(openDeviceResponse)); },
     selectConfiguration: function(h, cfg, cb) { fakeBridgeCalls.push(['selectConfiguration', h, cfg]); cb(JSON.stringify({ success: true })); },
     claimInterface: function(h, n, cb) { fakeBridgeCalls.push(['claimInterface', h, n]); cb(JSON.stringify(claimInterfaceResponse)); },
     releaseInterface: function(h, n, cb) { fakeBridgeCalls.push(['releaseInterface', h, n]); cb(JSON.stringify({ success: true })); },
@@ -176,6 +176,20 @@ async function main() {
     console.log('requestDevice: OK');
 
     await dev.open();
+
+    // 🛡️ 実Chrome(usb_device.ccのUSBDevice::open())を確認して判明した欠落:
+    //    open()は「すでにopened済みなら即座に成功解決する」冪等性を持つべき。
+    //    無いと、open()を2回呼ぶたびにPython側で新しいハンドルが発行され続け、
+    //    1回目のハンドル(claim済みインターフェースの情報を含む)がリークする。
+    {
+        const callsBeforeSecondOpen = fakeBridgeCalls.length;
+        assert.strictEqual(dev.opened, true);
+        await dev.open();
+        assert.strictEqual(fakeBridgeCalls.length, callsBeforeSecondOpen,
+            'すでにopened済みの状態でopen()を再度呼んでも、ブリッジへは問い合わせないはず');
+        console.log('open() is idempotent when already opened: OK');
+    }
+
     await dev.selectConfiguration(1);
     await dev.releaseInterface(0);
     await dev.reset();
@@ -183,7 +197,7 @@ async function main() {
     await dev.forget();
     assert.deepStrictEqual(
         fakeBridgeCalls.map(c => c[0]),
-        ['requestDeviceChooser', 'selectConfiguration', 'releaseInterface', 'resetDevice', 'clearHalt', 'forgetGrantedDevice']
+        ['requestDeviceChooser', 'openDevice', 'selectConfiguration', 'releaseInterface', 'resetDevice', 'clearHalt', 'forgetGrantedDevice']
     );
     console.log('selectConfiguration/releaseInterface/reset/clearHalt/forget wiring: OK');
 

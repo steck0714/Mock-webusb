@@ -607,16 +607,30 @@ class WebUSBBridge(QObject):
     @Slot(int, int, result=str)
     def claimInterface(self, handle_id, interface_number):
         """🛡️ WebUSB仕様が定める「保護対象インターフェースクラス」
-        (Audio/HID/Mass Storage/Smart Card/Video/Audio-Video/Wireless Controller)は
+        (Audio/HID/Mass Storage/Hub/Smart Card/Video/Audio-Video/Wireless Controller)は
         ここで一律拒否する。旧実装はインターフェースクラスを一切見ておらず、
         オリジンへの許可さえあればセキュリティキーやキーボードのHIDインターフェースにも
-        生アクセスできてしまっていた(WebHID等、別の専用APIが本来担うべき領域)。"""
+        生アクセスできてしまっていた(WebHID等、別の専用APIが本来担うべき領域)。
+        🛡️ 実Chrome(usb_device.ccのUSBDevice::claimInterface()を実際に取得して確認)
+        は、これより先にEnsureDeviceConfigured()相当のチェック(configurationが
+        選択されていること)を行う。これが無いと、configuration未選択のまま
+        claimInterface()が呼ばれた場合に「保護対象クラス」という誤った理由の
+        エラーになってしまっていた(interface_class_for()がget_active_configuration()
+        失敗時にNoneを返し、is_protected_interface_class(None)がTrueになるため、
+        機能的には拒否されていたが理由の表示が不正確だった)。"""
         try:
-            info = self._open_devices.get(handle_id)
             dev = self._get_open_device(handle_id)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
+            try:
+                dev.get_active_configuration()
+            except Exception:
+                return json.dumps({
+                    "success": False,
+                    "error": "InvalidStateError: the device must have a configuration selected",
+                })
 
+            info = self._open_devices.get(handle_id)
             iface_class = interface_class_for(dev, interface_number)
             if is_protected_interface_class(iface_class):
                 name = protected_class_name(iface_class)
@@ -643,12 +657,21 @@ class WebUSBBridge(QObject):
     def releaseInterface(self, handle_id, interface_number):
         """旧実装はJS側のreleaseInterface()がno-op(Promise.resolve()するだけ)で
         Python側に一切届いておらず、一度claimしたインターフェースは
-        デバイスを閉じるまで解放されなかった。"""
+        デバイスを閉じるまで解放されなかった。
+        🛡️ claimInterfaceと同様、実Chromeが要求するEnsureDeviceConfigured()相当の
+        チェック(configurationが選択されていること)も行う。"""
         try:
-            info = self._open_devices.get(handle_id)
             dev = self._get_open_device(handle_id)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
+            try:
+                dev.get_active_configuration()
+            except Exception:
+                return json.dumps({
+                    "success": False,
+                    "error": "InvalidStateError: the device must have a configuration selected",
+                })
+            info = self._open_devices.get(handle_id)
             _usb_core, usb_util = self._pyusb()
             usb_util.release_interface(dev, interface_number)
             if info is not None:
@@ -677,6 +700,12 @@ class WebUSBBridge(QObject):
         Device.set_interface_altsetting()へ実配線する(調査の結果、pyusb 1.x系の
         公開APIとして存在することを確認済み)。旧実装はJS側で常にNotSupportedErrorを
         返すだけのスタブだった。
+        🛡️ 実Chrome(usb_device.ccのUSBDevice::selectAlternateInterface()を実際に
+        取得して確認)は、これを呼ぶ前に必ずEnsureInterfaceClaimed()相当のチェックを
+        行い、対象interfaceがclaim済みでなければInvalidStateErrorで拒否する。
+        旧実装はこの確認が完全に欠落しており、claimInterface()を一度も呼ばずに
+        (=保護対象クラスの拒否を経由せずに)任意のインターフェース番号の
+        alternate settingを変更できてしまっていた。
         ★ 保護対象インターフェースクラスの判定は「インターフェース番号」単位で
         行っており、alternate setting違いでクラスが変わるような変則的デバイスは
         (稀だが)想定していない。claimInterfaceの時点で拒否されていれば
@@ -685,6 +714,13 @@ class WebUSBBridge(QObject):
             dev = self._get_open_device(handle_id)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
+            info = self._open_devices.get(handle_id) or {}
+            claimed = info.get("claimed_interfaces", set())
+            if interface_number not in claimed:
+                return json.dumps({
+                    "success": False,
+                    "error": "InvalidStateError: the specified interface has not been claimed",
+                })
             dev.set_interface_altsetting(interface=interface_number, alternate_setting=alternate_setting)
             return json.dumps({"success": True})
         except Exception as e:

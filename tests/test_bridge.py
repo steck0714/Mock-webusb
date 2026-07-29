@@ -150,6 +150,9 @@ class FakeDevice:
     def clear_halt(self, endpoint):
         self.last_clear_halt_call = {"endpoint": endpoint}
 
+    def set_interface_altsetting(self, interface=None, alternate_setting=None):
+        self.last_set_interface_altsetting_call = {"interface": interface, "alternate_setting": alternate_setting}
+
 
 class FakeUsbUtil:
     ENDPOINT_IN = 0x80
@@ -643,6 +646,49 @@ def test_isochronousTransfer_success_path_with_fake_backend():
     print("test_isochronousTransfer_success_path_with_fake_backend: OK")
 
 
+def test_selectAlternateInterface_requires_claimed_interface():
+    """実Chrome(usb_device.ccのUSBDevice::selectAlternateInterface()を実際に
+    取得して確認)は、これを呼ぶ前に対象interfaceがclaim済みであることを要求する
+    (EnsureInterfaceClaimed()、未claimならInvalidStateError)。旧実装はこの
+    確認が完全に欠落しており、claimInterface()を一度も呼ばずに任意の
+    インターフェース番号のalternate settingを変更できてしまっていた。"""
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [FakeEndpoint(0x81, 0x02)])
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [intf])])
+    bridge = make_bridge([dev_a])
+    bridge._is_granted = lambda *a, **kw: True
+    handle = json.loads(bridge.openDevice(0x2341, 0x8036))["handle"]
+
+    not_claimed = json.loads(bridge.selectAlternateInterface(handle, 0, 1))
+    assert not_claimed["success"] is False
+    assert not_claimed["error"].startswith("InvalidStateError:"), not_claimed
+
+    assert json.loads(bridge.claimInterface(handle, 0))["success"] is True
+    claimed = json.loads(bridge.selectAlternateInterface(handle, 0, 1))
+    assert claimed["success"] is True, claimed
+    print("test_selectAlternateInterface_requires_claimed_interface: OK")
+
+
+def test_claimInterface_and_releaseInterface_require_configuration_selected():
+    """実Chrome(usb_device.ccのUSBDevice::claimInterface()/releaseInterface()を
+    実際に取得して確認)は、どちらもEnsureDeviceConfigured()相当のチェック
+    (configurationが選択されていること)を先に行う。旧実装はこれが無く、
+    configuration未選択時のclaimInterface()は(結果的には拒否されるものの)
+    「保護対象クラス」という不正確な理由のエラーになっていた。"""
+    dev_a = FakeDevice(0x2341, 0x8036, [])  # configurationを1つも持たない = get_active_configuration()が例外を送出
+    bridge = make_bridge([dev_a])
+    bridge._is_granted = lambda *a, **kw: True
+    handle = json.loads(bridge.openDevice(0x2341, 0x8036))["handle"]
+
+    claim_result = json.loads(bridge.claimInterface(handle, 0))
+    assert claim_result["success"] is False
+    assert claim_result["error"].startswith("InvalidStateError:"), claim_result
+
+    release_result = json.loads(bridge.releaseInterface(handle, 0))
+    assert release_result["success"] is False
+    assert release_result["error"].startswith("InvalidStateError:"), release_result
+    print("test_claimInterface_and_releaseInterface_require_configuration_selected: OK")
+
+
 def test_requestDeviceChooser_reentrancy_guard(monkeypatch):
     """dlg.exec()は(実物のQtでは)ネストしたQtイベントループを回すため、その最中に
     同じWebUSBBridgeインスタンスへもう一度requestDeviceChooser()が呼ばれると、
@@ -760,6 +806,8 @@ if __name__ == "__main__":
     test_isochronousTransfer_rejects_non_uniform_packet_lengths()
     test_isochronousTransfer_requires_claimed_isochronous_endpoint()
     test_isochronousTransfer_success_path_with_fake_backend()
+    test_selectAlternateInterface_requires_claimed_interface()
+    test_claimInterface_and_releaseInterface_require_configuration_selected()
     test_requestDeviceChooser_reentrancy_guard(mp)
     test_requestDeviceChooser_is_registered_as_qt_slot()
     print("ALL BRIDGE TESTS PASSED")

@@ -23,6 +23,34 @@ spec prose alone, plus a first attempt at isochronous transfer support.
   `test_bulk_transfer_and_clearHalt_require_claimed_interface` and
   `test_bulk_transfer_rejects_out_of_range_endpoint_number`; confirmed both fail against a
   copy with the checks removed.
+- **`open()` (JS) had no idempotency check.** Real Chrome's `USBDevice::open()` resolves
+  immediately without doing anything if the device is already open. This implementation always
+  called through to `openDevice()` regardless, which — since `openDevice()` mints a brand new
+  handle every call — meant calling `open()` twice silently orphaned the first handle (and
+  anything claimed on it) with no way to ever close it again, since `this._handle` gets
+  overwritten by the second call. Added an early return when `this.opened` is already true.
+  Extended the JS test's exact-call-sequence assertion (now also tracking `openDevice` calls,
+  which the fake bridge previously didn't record) to confirm a second `open()` adds no new
+  bridge call.
+- **`selectAlternateInterface()` had no equivalent of Chrome's `EnsureInterfaceClaimed()`.**
+  Confirmed from the same Blink source: it requires the target interface to already be
+  claimed, rejecting with `InvalidStateError` otherwise. This implementation had no such
+  check at all — a page could change a never-claimed (including protected-class) interface's
+  alternate setting without ever calling `claimInterface()`. Added the check, matching
+  Chrome's exact error message. Added `test_selectAlternateInterface_requires_claimed_interface`;
+  confirmed it fails against a copy with the check removed.
+- **`claimInterface()`/`releaseInterface()` had no equivalent of Chrome's
+  `EnsureDeviceConfigured()`.** Also confirmed from Blink's source: both require a
+  configuration to already be selected, before anything else. Without an explicit check, a
+  device with no active configuration was *still* rejected by this implementation (since
+  `interface_class_for()` already falls back to "protected" when it can't determine an active
+  configuration — see the `0.0.1a0` entry above) but with a misleading `SecurityError:
+  ...protected interface class` message instead of the real reason. Added an explicit check at
+  the top of both methods with Chrome's exact wording
+  (`InvalidStateError: "the device must have a configuration selected"`). Added
+  `test_claimInterface_and_releaseInterface_require_configuration_selected`; confirmed it
+  fails (with the old, misleading `SecurityError` message) against a copy with the check
+  removed.
 
 ### Added
 - **Isochronous transfer support (`isochronousTransferIn`/`isochronousTransferOut`), best
