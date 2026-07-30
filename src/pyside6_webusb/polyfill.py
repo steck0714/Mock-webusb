@@ -100,7 +100,23 @@ def install(page, browser_window=None,
             script.setSourceCode(code)
             script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
             script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-            script.setRunsOnSubFrames(True)
+            # 🚨 セキュリティ上の理由でFalseにしている(以前はTrueだった)。
+            #    WebUSBBridge._current_origin()は「このブリッジを保持するページ」の
+            #    QWebEnginePage.url()を見て許可判定のオリジンを決めている。しかし
+            #    QWebEnginePage.url()は常にトップレベル(メインフレーム)のURLであり、
+            #    QWebChannelの呼び出しがページ内のどのフレーム(iframe)から来たかを
+            #    区別する手段が(PySide6の公開APIレベルでは)無い。
+            #    つまりTrueのままだと、トップレベルページに埋め込まれたクロス
+            #    オリジンのiframe内で動くスクリプトが navigator.usb.requestDevice()/
+            #    getDevices() を呼んだ場合、そのオリジンは(iframe自身の実際の
+            #    オリジンではなく)トップレベルページのオリジンとして扱われて
+            #    しまう。結果、そのiframeは自分自身には一切許可されていない、
+            #    トップレベルページが過去に許可したUSBデバイスへ完全にアクセス
+            #    できてしまう(オリジンの境界を跨いだ権限の混同)。
+            #    正しくフレーム単位でオリジンを特定する手段が無い以上、安全側に
+            #    倒してiframe内では最初からnavigator.usb自体を定義しない
+            #    (=メインフレームでしかWebUSBを使えない)方針にしている。
+            script.setRunsOnSubFrames(False)
             page.scripts().insert(script)
         except Exception as e:
             print(f"[pyside6-webusb] install: 例外を無視: {e}")

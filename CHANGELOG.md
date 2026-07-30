@@ -2,11 +2,36 @@
 
 All notable changes to this project are documented here.
 
-## [0.0.2]
+## [0.0.2b0]
 
 Continued the spec/Chrome-source comparison from `0.0.1a0`, this time pulling actual Chromium
 source (Blink's `usb_device.cc`, fetched live from `github.com/chromium/chromium`) rather than
 spec prose alone, plus a first attempt at isochronous transfer support.
+
+### Security
+- **🚨 Cross-origin iframes could access the top-level page's granted USB devices.**
+  `install()` injected the WebUSB polyfill with `script.setRunsOnSubFrames(True)`, meaning it
+  ran inside every iframe on a page, not just the top frame. `WebUSBBridge._current_origin()`
+  determines the origin to check permissions against from `QWebEnginePage.url()` — which is
+  *always* the top-level frame's URL; there's no way to determine which frame inside a page a
+  given `QWebChannel` call actually came from through PySide6's public API. The combination
+  meant a cross-origin iframe (a compromised ad, a malicious embed, anything the top-level page
+  didn't fully trust) calling `navigator.usb.requestDevice()`/`getDevices()` had its request
+  attributed to the *top-level page's* origin — not its own — giving it full access to every
+  USB device the top-level page had ever been granted, a complete bypass of the origin
+  isolation the rest of this codebase's permission model depends on. Since there's no
+  currently-available way to correctly attribute a `QWebChannel` call to the specific frame
+  that made it, the fix is to fail closed: `setRunsOnSubFrames(False)`, so `navigator.usb`
+  simply isn't defined inside any iframe at all (a real capability loss relative to real
+  Chrome, which does support properly-isolated WebUSB in cross-origin iframes — but a correct
+  and safe default given what this codebase can actually verify). Found by reading `install()`
+  end to end while looking for anything below `WebUSBBridge` itself that could affect the
+  security model, rather than only the bridge's own methods.
+  Added `tests/test_install.py` — there was **no test coverage of `install()` at all**
+  before this, using real `QWebEngineScript`/`QWebChannel` objects against a lightweight fake
+  page (no full `QWebEnginePage`/renderer needed). Confirmed
+  `test_install_does_not_run_scripts_on_subframes` fails against a copy with
+  `setRunsOnSubFrames(True)` restored.
 
 ### Fixed
 - **`bulkTransferIn`/`bulkTransferOut`/`clearHalt` had no equivalent of Chrome's
@@ -83,7 +108,7 @@ spec prose alone, plus a first attempt at isochronous transfer support.
     good candidate) and reports back.
 
 ### Project metadata
-- Version bumped to `0.0.2`.
+- Version bumped to `0.0.2b0`.
 
 
 
