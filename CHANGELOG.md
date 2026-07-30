@@ -2,6 +2,70 @@
 
 All notable changes to this project are documented here.
 
+## [0.0.3]
+
+Investigated whether per-frame origin attribution — the thing `0.0.2b0`'s `Security` entry
+concluded "isn't currently possible through PySide6's public API" — is actually possible after
+all, given a newer PySide6/Qt version. Also confirmed the currently-installed `pyusb` (1.3.1)
+is the latest release on PyPI, so the isochronous-transfer limitations documented in `0.0.2`
+aren't an artifact of using an outdated `pyusb`.
+
+### Researched: per-frame origin attribution (not yet implemented)
+
+**The earlier conclusion needs updating.** `QWebEngineFrame` — confirmed present in the
+installed `PySide6` 6.11.1 (`from PySide6.QtWebEngineCore import QWebEngineFrame`) — did not
+exist in older PySide6/Qt WebEngine releases, which is presumably why the `0.0.2b0` fix landed
+on "disable subframes entirely" as the only safe option available at the time. Verified
+empirically in this environment, against a real `QWebEnginePage` loading real HTML with an
+iframe (not just reading documentation):
+
+- `page.mainFrame()` returns a `QWebEngineFrame` for the top-level frame.
+- `frame.children()` recursively returns child frames — a real iframe
+  (`<iframe src="https://example.org/child.html" name="childframe">`) showed up correctly,
+  with its own accurate `.url()` (`https://example.org/child.html`) and `.name()`
+  (`childframe`), both read from Qt/Chromium's own frame-tracking (not from any
+  JS-supplied value) via `page.mainFrame().children()`.
+- `frame.runJavaScript(code, callback)` exists and accepts a per-frame target, though its
+  exact reliability (e.g. against a frame with no content loaded) wasn't fully pinned down in
+  this pass and needs more testing before depending on it.
+
+This changes the picture, but **does not by itself solve the problem** — `QWebEnginePage`'s
+`setWebChannel(channel, worldId=None)` (confirmed via its actual overload signature) is still
+page-scoped, not frame-scoped, and there's still no signal or callback that tells Python
+"this specific incoming `QWebChannel` call came from *this* frame." Enumerating frames answers
+"what frames currently exist and what are their real origins" — it doesn't answer "which frame
+just invoked `requestDeviceChooser()`."
+
+**A viable design, sketched but not implemented:** have Python (not JS) mint an unguessable,
+per-frame token, push it into that specific frame via `frame.runJavaScript()` (so only code
+genuinely running in that frame ever sees its own token — a different frame can't read it
+without breaking same-origin isolation itself), and have every bridge call include that token
+as an actual parameter (not a separately-set piece of state, which would race across frames
+issuing concurrent calls) so Python can look up the real origin the token was issued for. This
+needs re-verifying tokens periodically (there's no per-iframe navigation signal at the
+`QWebEnginePage` level — confirmed empirically: `loadFinished`/`loadStarted` only fired once
+for a page containing an iframe, not once per frame — so detecting a frame's origin changing
+out from under an issued token means polling `mainFrame()`/`children()` on a timer, similar to
+the existing hotplug-device watcher).
+
+**Why this isn't implemented yet:** doing it properly means adding a token parameter to every
+transfer/permission `@Slot` (roughly 19 methods), the matching change to every `callBridge()`
+call site in the polyfill, and re-validating the entire existing test suite against the new
+signatures — a substantially larger and more security-sensitive change than the surgical fixes
+in this and the previous few versions, and one that deserves dedicated review rather than
+landing alongside unrelated work. Recorded here as a concrete, verified-feasible design so it
+doesn't have to be re-researched from scratch, and so `setRunsOnSubFrames(False)` in `install()`
+is understood as "safe default pending this work," not "believed impossible."
+
+### Verified, no change needed
+- `pyusb` 1.3.1 (currently installed) is the latest version on PyPI (checked via
+  `pip index versions pyusb`) — the isochronous-transfer caveats from `0.0.2` (no public
+  high-level API, uniform-packet-length-only backend) reflect `pyusb`'s actual current state,
+  not an outdated dependency.
+
+### Project metadata
+- Version bumped to `0.0.3`.
+
 ## [0.0.2b0]
 
 Continued the spec/Chrome-source comparison from `0.0.1a0`, this time pulling actual Chromium
