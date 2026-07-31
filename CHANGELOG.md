@@ -2,6 +2,54 @@
 
 All notable changes to this project are documented here.
 
+## [0.0.3a0]
+
+Follow-up to `0.0.3`'s research question: does a per-frame navigation/load signal actually
+exist? Also extracted the DOMException-prefix convention into its own module and added its own
+test coverage.
+
+### Researched further: `navigationRequested` is the per-frame signal that was missing
+
+`0.0.3` confirmed `QWebEngineFrame` can enumerate frames and their real origins, but noted
+`loadFinished`/`loadStarted` only fire once per page load, not once per frame — leaving "how do
+we know when a new/navigating frame appears" unanswered. Dumped `QWebEnginePage`'s full signal
+list via `QMetaObject` (rather than guessing from documentation) and found
+`navigationRequested(QWebEngineNavigationRequest&)`, which carries `.url()` and
+`.isMainFrame()`. Verified empirically against a real `QWebEnginePage` loading local HTML with
+two iframes: it fired **three times** — once for the top-level page (`isMainFrame=True`) and
+once for *each* iframe (`isMainFrame=False`), each with its own correct URL. This is exactly
+the per-frame trigger `0.0.3` said didn't exist at the `QWebEnginePage` level.
+
+This doesn't complete the design by itself. Correlating a `navigationRequested` event to the
+specific `QWebEngineFrame` object needed for `runJavaScript()`-based token delivery still
+requires re-walking `mainFrame()`/`children()` after the signal fires (the navigation request
+arrives before the frame necessarily exists in the tree). More significantly, re-checking the
+full design against `_get_open_device()` — the choke point roughly a dozen other `@Slot`
+methods funnel through to authorize use of an already-open handle — showed that a token can't
+be limited to just the three entry-point methods (`getDevices`, `requestDevice`, `open`) the
+way `0.0.3` hoped: unless *every* handle-consuming call also resolves the real calling frame's
+origin, a handle legitimately opened by a subframe would fail every subsequent operation
+against the (unfixed) top-level-page-only origin check — safe, but non-functional, not a real
+fix. Confirming this needs the token threaded through every handle-consuming method (not just
+three) before it can be both correct and usable; not attempted in this version for the same
+reason as `0.0.3` — it's a wide, security-sensitive change that deserves to land as its own
+reviewable unit, not mixed in with this version's other fixes.
+
+### Added
+- **`errors.py`**: centralizes the `"SecurityError:"`/`"InvalidStateError:"`/`"NotFoundError:"`/
+  `"InvalidAccessError:"`/`"IndexSizeError:"` prefix convention that `polyfill.py`'s
+  `throwFromResult()` matches against. Previously these were hand-typed as raw f-strings in
+  (at least) 10 places in `bridge.py` — functional, but a typo in any of them (e.g.
+  `"SecurtyError:"`) wouldn't be a syntax error, just a silently-wrong `DOMException` name
+  reaching JS, since `throwFromResult()` would fail to recognize the misspelled prefix and fall
+  back to whatever generic default the caller specified. `bridge.py` now calls
+  `security_error(msg)` etc. instead of constructing the string inline, including
+  `_control_transfer_validation_error()`'s local `_err()` helper, which now delegates to the
+  same functions rather than duplicating the prefix format. Added `tests/test_errors.py`.
+
+### Project metadata
+- Version bumped to `0.0.3a0`.
+
 ## [0.0.3]
 
 Investigated whether per-frame origin attribution — the thing `0.0.2b0`'s `Security` entry

@@ -28,6 +28,13 @@ import time
 
 from PySide6.QtCore import QObject, Signal, Slot, QTimer, QSettings
 
+from .errors import (
+    index_size_error,
+    invalid_access_error,
+    invalid_state_error,
+    not_found_error,
+    security_error,
+)
 from .hardening import (
     UsbHotplugWatcher,
     build_device_descriptor,
@@ -460,7 +467,7 @@ class WebUSBBridge(QObject):
         if self._chooser_active:
             return json.dumps({
                 "cancelled": True,
-                "error": "InvalidStateError: a device chooser is already open for this page",
+                "error": invalid_state_error("a device chooser is already open for this page"),
             })
         self._chooser_active = True
         try:
@@ -575,7 +582,7 @@ class WebUSBBridge(QObject):
             if not self._is_granted(origin, vendor_id, product_id):
                 return json.dumps({"success": False, "error": "Permission denied: this origin has not been granted access to this device"})
             if is_blocklisted_device(vendor_id, product_id):
-                return json.dumps({"success": False, "error": "SecurityError: this device is on the protected security-key blocklist and cannot be accessed via WebUSB"})
+                return json.dumps({"success": False, "error": security_error("this device is on the protected security-key blocklist and cannot be accessed via WebUSB")})
             usb_core, _usb_util = self._pyusb()
             dev = usb_core.find(idVendor=vendor_id, idProduct=product_id)
             if dev is None:
@@ -627,7 +634,7 @@ class WebUSBBridge(QObject):
             except Exception:
                 return json.dumps({
                     "success": False,
-                    "error": "InvalidStateError: the device must have a configuration selected",
+                    "error": invalid_state_error("the device must have a configuration selected"),
                 })
 
             info = self._open_devices.get(handle_id)
@@ -636,8 +643,10 @@ class WebUSBBridge(QObject):
                 name = protected_class_name(iface_class)
                 return json.dumps({
                     "success": False,
-                    "error": f"SecurityError: interface {interface_number} is class '{name}', "
-                             f"which is a protected interface class and cannot be claimed via WebUSB",
+                    "error": security_error(
+                        f"interface {interface_number} is class '{name}', "
+                        f"which is a protected interface class and cannot be claimed via WebUSB"
+                    ),
                 })
 
             _usb_core, usb_util = self._pyusb()
@@ -669,7 +678,7 @@ class WebUSBBridge(QObject):
             except Exception:
                 return json.dumps({
                     "success": False,
-                    "error": "InvalidStateError: the device must have a configuration selected",
+                    "error": invalid_state_error("the device must have a configuration selected"),
                 })
             info = self._open_devices.get(handle_id)
             _usb_core, usb_util = self._pyusb()
@@ -719,7 +728,7 @@ class WebUSBBridge(QObject):
             if interface_number not in claimed:
                 return json.dumps({
                     "success": False,
-                    "error": "InvalidStateError: the specified interface has not been claimed",
+                    "error": invalid_state_error("the specified interface has not been claimed"),
                 })
             dev.set_interface_altsetting(interface=interface_number, alternate_setting=alternate_setting)
             return json.dumps({"success": True})
@@ -766,7 +775,7 @@ class WebUSBBridge(QObject):
         if not (1 <= endpoint_number <= 15):
             return json.dumps({
                 "success": False,
-                "error": f"IndexSizeError: endpoint number {endpoint_number} is out of range (must be 1-15)",
+                "error": index_size_error(f"endpoint number {endpoint_number} is out of range (must be 1-15)"),
             }), None
         info = self._open_devices.get(handle_id) or {}
         claimed = info.get("claimed_interfaces", set())
@@ -775,7 +784,7 @@ class WebUSBBridge(QObject):
         except Exception:
             return json.dumps({
                 "success": False,
-                "error": "InvalidStateError: the device must have a configuration selected",
+                "error": invalid_state_error("the device must have a configuration selected"),
             }), None
 
         owner_number = None
@@ -799,8 +808,8 @@ class WebUSBBridge(QObject):
             direction_word = "IN" if in_transfer else "OUT"
             return json.dumps({
                 "success": False,
-                "error": (
-                    f"NotFoundError: {direction_word} endpoint {endpoint_number} is not part "
+                "error": not_found_error(
+                    f"{direction_word} endpoint {endpoint_number} is not part "
                     "of a claimed and selected alternate interface"
                 ),
             }), None
@@ -819,9 +828,8 @@ class WebUSBBridge(QObject):
             if type_name != required_type:
                 return json.dumps({
                     "success": False,
-                    "error": (
-                        f"InvalidAccessError: endpoint {endpoint_number} is a {type_name} "
-                        f"endpoint, not {required_type}"
+                    "error": invalid_access_error(
+                        f"endpoint {endpoint_number} is a {type_name} endpoint, not {required_type}"
                     ),
                 }), None
 
@@ -922,8 +930,14 @@ class WebUSBBridge(QObject):
         req_kind = (request_type >> 5) & 0x03      # 0=standard,1=class,2=vendor
         recipient = request_type & 0x03            # 0=device,1=interface,2=endpoint,3=other
 
+        _ERROR_BUILDERS = {
+            "SecurityError": security_error,
+            "InvalidStateError": invalid_state_error,
+            "NotFoundError": not_found_error,
+        }
+
         def _err(name, msg):
-            return json.dumps({"success": False, "error": f"{name}: {msg}"})
+            return json.dumps({"success": False, "error": _ERROR_BUILDERS[name](msg)})
 
         if req_kind == 0:  # standard
             if not direction_in:
