@@ -227,7 +227,7 @@ def make_bridge(devices):
     bridge._record_device_usage = lambda *a, **kw: None
     grants = []
     bridge._grant = lambda origin, vid, pid: grants.append((origin, vid, pid))
-    bridge._current_origin = lambda: "https://example.test"
+    bridge._current_origin = lambda *a, **kw: "https://example.test"
     bridge.__test_grants__ = grants
     return bridge
 
@@ -350,7 +350,7 @@ def test_full_flow_persists_grant_and_usage_without_mocking_internals(monkeypatc
     dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [])])
     bridge = WebUSBBridge()  # _grant/_record_device_usageは上書きしない(実装をそのまま使う)
     bridge._pyusb = lambda: (FakeUsbCore([dev_a]), FakeUsbUtil())
-    bridge._current_origin = lambda: "https://example.test"
+    bridge._current_origin = lambda *a, **kw: "https://example.test"
 
     tmp_dir = str(tmp_path) if tmp_path is not None else tempfile.mkdtemp(prefix="pyside6_webusb_test_")
     ini_path = os.path.join(tmp_dir, "settings.ini")
@@ -721,6 +721,89 @@ def test_requestDeviceChooser_reentrancy_guard(monkeypatch):
     print("test_requestDeviceChooser_reentrancy_guard: OK")
 
 
+def test_frame_tracker_wired_denies_empty_and_forged_tokens():
+    """🛡️ 0.0.2b0で見つかった脆弱性(クロスオリジンiframeがトップレベルページに
+    成りすませる)を、0.0.3bで実装したフレーム単位オリジン特定が実際に防いでいる
+    ことを確認する核心的なテスト。_frame_trackerが配線されている(=install()経由の
+    実運用を模した)状態で、
+      - 正規のトークン(トラッカーが「本当にiframe自身のオリジン」だと知っている
+        値)を渡した呼び出しは、そのiframe自身に許可されたデバイスだけを扱える
+      - 空文字列や、でたらめな(=盗み見/偽造された)トークンを渡した呼び出しは、
+        (素のQWebChannelオブジェクトを直接叩く敵対的なコードを想定したもの)
+        トップレベルページへ成りすますことなく、常にオリジン不明として拒否される
+    ことを確認する。"""
+    class FakeFrameTracker:
+        def __init__(self, mapping):
+            self._mapping = mapping
+
+        def origin_for_token(self, token):
+            return self._mapping.get(token) if token else None
+
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [])])
+    bridge = make_bridge([dev_a])
+    del bridge._current_origin  # make_bridge()の固定値lambdaオーバーライドを解除し、本来のメソッド(_frame_trackerを見る)へ戻す
+    top_level_origin = "https://top-level-page.example"
+    iframe_origin = "https://cross-origin-iframe.example"
+    iframe_token = "genuine-token-for-the-iframe"
+    bridge._frame_tracker = FakeFrameTracker({iframe_token: iframe_origin})
+    # このテストの対象はフレーム単位オリジン解決そのものなので、許可判定は
+    # 「iframe自身のオリジンにだけ許可がある」という状況を素朴に模す。
+    bridge._is_granted = lambda origin, vid, pid: origin == iframe_origin
+
+    # 正規のトークンでは、iframe自身に許可されたデバイスを開ける。
+    genuine = json.loads(bridge.openDevice(0x2341, 0x8036, iframe_token))
+    assert genuine["success"] is True, genuine
+
+    # 空トークン(=トークンを送らない)では、トップレベルページに成りすませない
+    # (トップレベルページには実運用上page.url()経由のトークンがあるはずだが、
+    # このテストのフェイクトラッカーはトップレベルページ用のトークンを一切
+    # 知らないので、常にNoneに解決される=拒否される)。
+    empty_token_attempt = json.loads(bridge.openDevice(0x2341, 0x8036, ""))
+    assert empty_token_attempt["success"] is False
+    assert "Permission denied" in empty_token_attempt["error"] or "denied" in empty_token_attempt["error"].lower()
+
+    # でたらめな(=知り得ないはずの)トークンでも同様に拒否される。
+    forged_attempt = json.loads(bridge.openDevice(0x2341, 0x8036, "totally-forged-token"))
+    assert forged_attempt["success"] is False
+    print("test_frame_tracker_wired_denies_empty_and_forged_tokens: OK")
+
+
+def test_frame_tracker_wired_isolates_handles_between_different_frame_origins():
+    """フレームトラッカー配線時、あるオリジン(トークンA)が開いたハンドルを、
+    別のオリジン(トークンB)からは(handle_idの数値さえ分かっていても)使えない
+    ことを確認する(_get_open_device()のorigin照合がframe_token経由でも
+    正しく機能していることの確認)。"""
+    class FakeFrameTracker:
+        def __init__(self, mapping):
+            self._mapping = mapping
+
+        def origin_for_token(self, token):
+            return self._mapping.get(token) if token else None
+
+    intf = FakeInterface(0, 0, 0xFF, 0x00, 0x00, [FakeEndpoint(0x81, 0x02)])
+    dev_a = FakeDevice(0x2341, 0x8036, [FakeConfiguration(1, [intf])])
+    bridge = make_bridge([dev_a])
+    del bridge._current_origin  # make_bridge()の固定値lambdaオーバーライドを解除
+    origin_a, token_a = "https://frame-a.example", "token-a"
+    origin_b, token_b = "https://frame-b.example", "token-b"
+    bridge._frame_tracker = FakeFrameTracker({token_a: origin_a, token_b: origin_b})
+    bridge._is_granted = lambda origin, vid, pid: origin in (origin_a, origin_b)
+
+    open_result = json.loads(bridge.openDevice(0x2341, 0x8036, token_a))
+    assert open_result["success"] is True
+    handle = open_result["handle"]
+
+    # 同じhandle_idでも、別オリジン(token_b)からはclaimInterfaceできない。
+    stolen_attempt = json.loads(bridge.claimInterface(handle, 0, token_b))
+    assert stolen_attempt["success"] is False
+    assert stolen_attempt["error"] == "Invalid device handle"
+
+    # 発行元本人(token_a)なら問題なく使える。
+    legit_attempt = json.loads(bridge.claimInterface(handle, 0, token_a))
+    assert legit_attempt["success"] is True, legit_attempt
+    print("test_frame_tracker_wired_isolates_handles_between_different_frame_origins: OK")
+
+
 def test_requestDeviceChooser_is_registered_as_qt_slot():
     """QWebChannel's QMetaObjectPublisher only exposes methods that are registered
     as Qt Slots on staticMetaObject to the JS-side proxy object -- plain Python
@@ -808,6 +891,8 @@ if __name__ == "__main__":
     test_isochronousTransfer_success_path_with_fake_backend()
     test_selectAlternateInterface_requires_claimed_interface()
     test_claimInterface_and_releaseInterface_require_configuration_selected()
+    test_frame_tracker_wired_denies_empty_and_forged_tokens()
+    test_frame_tracker_wired_isolates_handles_between_different_frame_origins()
     test_requestDeviceChooser_reentrancy_guard(mp)
     test_requestDeviceChooser_is_registered_as_qt_slot()
     print("ALL BRIDGE TESTS PASSED")

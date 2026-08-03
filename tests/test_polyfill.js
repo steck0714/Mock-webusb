@@ -51,25 +51,25 @@ function makeSignal() {
 const fakeBridge = {
     deviceConnected: makeSignal(),
     deviceDisconnected: makeSignal(),
-    listDevices: function(cb) { cb(JSON.stringify({ devices: fakeDevices })); },
-    requestDeviceChooser: function(optionsJson, cb) {
-        fakeBridgeCalls.push(['requestDeviceChooser', optionsJson]);
+    listDevices: function(frameToken, cb) { fakeBridgeCalls.push(['listDevices', frameToken]); cb(JSON.stringify({ devices: fakeDevices })); },
+    requestDeviceChooser: function(optionsJson, frameToken, cb) {
+        fakeBridgeCalls.push(['requestDeviceChooser', optionsJson, frameToken]);
         cb(JSON.stringify({ device: fakeDevices[0] }));
     },
-    openDevice: function(vid, pid, cb) { fakeBridgeCalls.push(['openDevice', vid, pid]); cb(JSON.stringify(openDeviceResponse)); },
-    selectConfiguration: function(h, cfg, cb) { fakeBridgeCalls.push(['selectConfiguration', h, cfg]); cb(JSON.stringify({ success: true })); },
-    claimInterface: function(h, n, cb) { fakeBridgeCalls.push(['claimInterface', h, n]); cb(JSON.stringify(claimInterfaceResponse)); },
-    releaseInterface: function(h, n, cb) { fakeBridgeCalls.push(['releaseInterface', h, n]); cb(JSON.stringify({ success: true })); },
-    resetDevice: function(h, cb) { fakeBridgeCalls.push(['resetDevice', h]); cb(JSON.stringify({ success: true })); },
-    clearHalt: function(h, dir, ep, cb) { fakeBridgeCalls.push(['clearHalt', h, dir, ep]); cb(JSON.stringify({ success: true })); },
-    forgetGrantedDevice: function(vid, pid, cb) { fakeBridgeCalls.push(['forgetGrantedDevice', vid, pid]); cb(JSON.stringify({ success: true })); },
-    selectAlternateInterface: function(h, n, alt, cb) { fakeBridgeCalls.push(['selectAlternateInterface', h, n, alt]); cb(JSON.stringify({ success: true })); },
-    bulkTransferIn: function(h, ep, len, cb) { fakeBridgeCalls.push(['bulkTransferIn', h, ep, len]); cb(JSON.stringify(bulkTransferInResponse)); },
-    bulkTransferOut: function(h, ep, dataHex, cb) { fakeBridgeCalls.push(['bulkTransferOut', h, ep, dataHex]); cb(JSON.stringify(bulkTransferOutResponse)); },
-    controlTransferIn: function(h, rt, req, val, idx, len, cb) { fakeBridgeCalls.push(['controlTransferIn', h, rt, req, val, idx, len]); cb(JSON.stringify(controlTransferInResponse)); },
-    controlTransferOut: function(h, rt, req, val, idx, dataHex, cb) { fakeBridgeCalls.push(['controlTransferOut', h, rt, req, val, idx, dataHex]); cb(JSON.stringify(controlTransferOutResponse)); },
-    isochronousTransferIn: function(h, ep, packetLengthsJson, cb) { fakeBridgeCalls.push(['isochronousTransferIn', h, ep, packetLengthsJson]); cb(JSON.stringify(isochronousTransferInResponse)); },
-    isochronousTransferOut: function(h, ep, dataHex, packetLengthsJson, cb) { fakeBridgeCalls.push(['isochronousTransferOut', h, ep, dataHex, packetLengthsJson]); cb(JSON.stringify(isochronousTransferOutResponse)); },
+    openDevice: function(vid, pid, frameToken, cb) { fakeBridgeCalls.push(['openDevice', vid, pid, frameToken]); cb(JSON.stringify(openDeviceResponse)); },
+    selectConfiguration: function(h, cfg, frameToken, cb) { fakeBridgeCalls.push(['selectConfiguration', h, cfg, frameToken]); cb(JSON.stringify({ success: true })); },
+    claimInterface: function(h, n, frameToken, cb) { fakeBridgeCalls.push(['claimInterface', h, n, frameToken]); cb(JSON.stringify(claimInterfaceResponse)); },
+    releaseInterface: function(h, n, frameToken, cb) { fakeBridgeCalls.push(['releaseInterface', h, n, frameToken]); cb(JSON.stringify({ success: true })); },
+    resetDevice: function(h, frameToken, cb) { fakeBridgeCalls.push(['resetDevice', h, frameToken]); cb(JSON.stringify({ success: true })); },
+    clearHalt: function(h, dir, ep, frameToken, cb) { fakeBridgeCalls.push(['clearHalt', h, dir, ep, frameToken]); cb(JSON.stringify({ success: true })); },
+    forgetGrantedDevice: function(vid, pid, frameToken, cb) { fakeBridgeCalls.push(['forgetGrantedDevice', vid, pid, frameToken]); cb(JSON.stringify({ success: true })); },
+    selectAlternateInterface: function(h, n, alt, frameToken, cb) { fakeBridgeCalls.push(['selectAlternateInterface', h, n, alt, frameToken]); cb(JSON.stringify({ success: true })); },
+    bulkTransferIn: function(h, ep, len, frameToken, cb) { fakeBridgeCalls.push(['bulkTransferIn', h, ep, len, frameToken]); cb(JSON.stringify(bulkTransferInResponse)); },
+    bulkTransferOut: function(h, ep, dataHex, frameToken, cb) { fakeBridgeCalls.push(['bulkTransferOut', h, ep, dataHex, frameToken]); cb(JSON.stringify(bulkTransferOutResponse)); },
+    controlTransferIn: function(h, rt, req, val, idx, len, frameToken, cb) { fakeBridgeCalls.push(['controlTransferIn', h, rt, req, val, idx, len, frameToken]); cb(JSON.stringify(controlTransferInResponse)); },
+    controlTransferOut: function(h, rt, req, val, idx, dataHex, frameToken, cb) { fakeBridgeCalls.push(['controlTransferOut', h, rt, req, val, idx, dataHex, frameToken]); cb(JSON.stringify(controlTransferOutResponse)); },
+    isochronousTransferIn: function(h, ep, packetLengthsJson, frameToken, cb) { fakeBridgeCalls.push(['isochronousTransferIn', h, ep, packetLengthsJson, frameToken]); cb(JSON.stringify(isochronousTransferInResponse)); },
+    isochronousTransferOut: function(h, ep, dataHex, packetLengthsJson, frameToken, cb) { fakeBridgeCalls.push(['isochronousTransferOut', h, ep, dataHex, packetLengthsJson, frameToken]); cb(JSON.stringify(isochronousTransferOutResponse)); },
 };
 
 global.qt = { webChannelTransport: {} };
@@ -393,6 +393,25 @@ async function main() {
     await new Promise(r => setTimeout(r, 5));
     assert.ok(disconnectViaProperty, 'ondisconnect handler should fire');
     console.log('disconnect event dispatch via ondisconnect property: OK');
+
+    // 🛡️ frame_origin.FrameOriginTracker がPython側からwindow.__pyUsbFrameToken
+    //    へ書き込んだ値が、実際に全てのブリッジ呼び出しの末尾引数として
+    //    送られることを確認する(0.0.3bで実装したフレーム単位オリジン特定の
+    //    中核となる契約)。未設定の場合は空文字列が送られることも確認する。
+    delete window.__pyUsbFrameToken;
+    fakeBridgeCalls.length = 0;
+    await navigator.usb.getDevices();
+    assert.strictEqual(fakeBridgeCalls[0][0], 'listDevices');
+    assert.strictEqual(fakeBridgeCalls[0][1], '', 'トークン未設定時は空文字列が送られるはず');
+    console.log('frame token defaults to empty string when window.__pyUsbFrameToken is unset: OK');
+
+    window.__pyUsbFrameToken = 'test-frame-token-xyz';
+    fakeBridgeCalls.length = 0;
+    await navigator.usb.getDevices();
+    assert.strictEqual(fakeBridgeCalls[0][0], 'listDevices');
+    assert.strictEqual(fakeBridgeCalls[0][1], 'test-frame-token-xyz', 'window.__pyUsbFrameTokenの値がそのまま送られるはず');
+    console.log('frame token is forwarded to the bridge when window.__pyUsbFrameToken is set: OK');
+    delete window.__pyUsbFrameToken;
 
     console.log('ALL WEBUSB POLYFILL JS TESTS PASSED');
 }

@@ -73,6 +73,7 @@ def install(page, browser_window=None,
     from PySide6.QtWebEngineCore import QWebEngineScript
 
     from .bridge import WebUSBBridge
+    from .frame_origin import FrameOriginTracker
 
     try:
         bridge = WebUSBBridge(browser_window=browser_window, parent=page,
@@ -83,6 +84,28 @@ def install(page, browser_window=None,
         page.setWebChannel(channel)
     except Exception:
         return None  # QWebChannel自体が使えない環境では静かに諦める(アプリ全体は落とさない)
+
+    try:
+        # 🛡️ フレーム単位オリジン特定(frame_origin.FrameOriginTracker、詳細はそちらの
+        #    モジュールdocstring及びCHANGELOG.mdの0.0.2b0/0.0.3/0.0.3a0/0.0.3bを参照)。
+        #    これが無かった0.0.2b0では、setRunsOnSubFrames(False)にしてiframeへの
+        #    公開自体を諦めることで安全側に倒していた。ここで実際に配線することで、
+        #    各フレーム(メインフレーム含む)が個別に発行されたトークンを持ち、
+        #    WebUSBBridge._current_origin(frame_token)がそのトークンからのみ
+        #    オリジンを解決できるようになる(トークンを渡さない/不正なトークンは
+        #    常に「オリジン不明」= 拒否になる。トップレベルページへのフォール
+        #    バックは一切行わない)。
+        tracker = FrameOriginTracker(page)
+        tracker.wire()
+        if tracker.is_functional:
+            bridge._frame_tracker = tracker
+        else:
+            print("[pyside6-webusb] install: navigationRequestedに接続できないため、"
+                  "navigator.usbはメインフレームのみに制限されます(古いPySide6/Qtの可能性があります)")
+            bridge._frame_tracker = None
+    except Exception as e:
+        print(f"[pyside6-webusb] install: FrameOriginTrackerの配線に失敗(navigator.usbはメインフレームのみに制限されます): {e}")
+        bridge._frame_tracker = None
 
     try:
         qwc_js = qwebchannel_js if qwebchannel_js is not None else _load_qwebchannel_js()
@@ -100,23 +123,11 @@ def install(page, browser_window=None,
             script.setSourceCode(code)
             script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
             script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-            # 🚨 セキュリティ上の理由でFalseにしている(以前はTrueだった)。
-            #    WebUSBBridge._current_origin()は「このブリッジを保持するページ」の
-            #    QWebEnginePage.url()を見て許可判定のオリジンを決めている。しかし
-            #    QWebEnginePage.url()は常にトップレベル(メインフレーム)のURLであり、
-            #    QWebChannelの呼び出しがページ内のどのフレーム(iframe)から来たかを
-            #    区別する手段が(PySide6の公開APIレベルでは)無い。
-            #    つまりTrueのままだと、トップレベルページに埋め込まれたクロス
-            #    オリジンのiframe内で動くスクリプトが navigator.usb.requestDevice()/
-            #    getDevices() を呼んだ場合、そのオリジンは(iframe自身の実際の
-            #    オリジンではなく)トップレベルページのオリジンとして扱われて
-            #    しまう。結果、そのiframeは自分自身には一切許可されていない、
-            #    トップレベルページが過去に許可したUSBデバイスへ完全にアクセス
-            #    できてしまう(オリジンの境界を跨いだ権限の混同)。
-            #    正しくフレーム単位でオリジンを特定する手段が無い以上、安全側に
-            #    倒してiframe内では最初からnavigator.usb自体を定義しない
-            #    (=メインフレームでしかWebUSBを使えない)方針にしている。
-            script.setRunsOnSubFrames(False)
+            # 🛡️ FrameOriginTrackerが上で正常に配線できた場合のみTrueにする。
+            #    配線に失敗した(=bridge._frame_trackerがNoneのままの)場合は、
+            #    0.0.2b0の判断を踏襲してFalseのままにする(安全側優先。
+            #    詳しくはWebUSBBridge._current_origin()のdocstring参照)。
+            script.setRunsOnSubFrames(bridge._frame_tracker is not None)
             page.scripts().insert(script)
         except Exception as e:
             print(f"[pyside6-webusb] install: 例外を無視: {e}")
@@ -148,6 +159,18 @@ WEBUSB_POLYFILL_JS = r"""
                 bridge[method].apply(bridge, args.concat([function(res) { resolve(JSON.parse(res)); }]));
             });
         });
+    }
+
+    // 🛡️ frame_origin.FrameOriginTracker がPython側から
+    //    runJavaScript('window.__pyUsbFrameToken = "...";') で書き込む値。
+    //    これをPython側のオリジン判定(WebUSBBridge._current_origin())へ渡すことで、
+    //    このフレームが本当は誰なのかをQt/Chromium自身の判定に基づいて特定できる
+    //    (このスクリプト自身がwindow.location.originを自己申告するのではない --
+    //    素のQWebChannelオブジェクトを直接叩く敵対的なコードに対しても安全)。
+    //    ページ読み込み直後、トークンがまだ届いていない短い時間帯は空文字になり、
+    //    その間の呼び出しはPython側で「オリジン不明」として安全に拒否される。
+    function _frameToken() {
+        return window.__pyUsbFrameToken || '';
     }
 
     function bytesToHex(view) {
@@ -269,7 +292,7 @@ WEBUSB_POLYFILL_JS = r"""
         //    (closeDevice()を呼ぶ手段が失われるリーク)。
         if (this.opened) return Promise.resolve();
         var self = this;
-        return callBridge('openDevice', this.vendorId, this.productId).then(function(res) {
+        return callBridge('openDevice', this.vendorId, this.productId, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Failed to open device');
             self._handle = res.handle;
             self.opened = true;
@@ -284,7 +307,7 @@ WEBUSB_POLYFILL_JS = r"""
     };
     OpenWebUSBDevice.prototype.selectConfiguration = function(configurationValue) {
         var self = this;
-        return callBridge('selectConfiguration', this._handle, configurationValue).then(function(res) {
+        return callBridge('selectConfiguration', this._handle, configurationValue, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Failed to select configuration');
             // 実仕様どおり、選択成功後はconfigurationが新しい設定を指すよう更新する。
             var match = (self.configurations || []).filter(function(c) { return c.configurationValue === configurationValue; })[0];
@@ -293,7 +316,7 @@ WEBUSB_POLYFILL_JS = r"""
     };
     OpenWebUSBDevice.prototype.claimInterface = function(n) {
         var self = this;
-        return callBridge('claimInterface', this._handle, n).then(function(res) {
+        return callBridge('claimInterface', this._handle, n, _frameToken()).then(function(res) {
             // 保護対象クラスによる拒否だけがSecurityError、それ以外(ハンドル不正・
             // libusb側のclaim失敗)はNetworkErrorが実仕様どおりの振り分け。
             if (!res.success) throwFromResult(res, 'Failed to claim interface');
@@ -302,14 +325,14 @@ WEBUSB_POLYFILL_JS = r"""
     };
     OpenWebUSBDevice.prototype.releaseInterface = function(n) {
         var self = this;
-        return callBridge('releaseInterface', this._handle, n).then(function(res) {
+        return callBridge('releaseInterface', this._handle, n, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Failed to release interface');
             setInterfaceClaimed(self, n, false);
         });
     };
     OpenWebUSBDevice.prototype.selectAlternateInterface = function(interfaceNumber, alternateSetting) {
         var self = this;
-        return callBridge('selectAlternateInterface', this._handle, interfaceNumber, alternateSetting).then(function(res) {
+        return callBridge('selectAlternateInterface', this._handle, interfaceNumber, alternateSetting, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Failed to select alternate interface');
             var iface = ((self.configuration && self.configuration.interfaces) || [])
                 .filter(function(i) { return i.interfaceNumber === interfaceNumber; })[0];
@@ -320,23 +343,23 @@ WEBUSB_POLYFILL_JS = r"""
         });
     };
     OpenWebUSBDevice.prototype.reset = function() {
-        return callBridge('resetDevice', this._handle).then(function(res) {
+        return callBridge('resetDevice', this._handle, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Failed to reset device');
         });
     };
     OpenWebUSBDevice.prototype.clearHalt = function(direction, endpointNumber) {
-        return callBridge('clearHalt', this._handle, direction, endpointNumber).then(function(res) {
+        return callBridge('clearHalt', this._handle, direction, endpointNumber, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Failed to clear halt');
         });
     };
     OpenWebUSBDevice.prototype.forget = function() {
         var self = this;
-        return callBridge('forgetGrantedDevice', this.vendorId, this.productId).then(function() {
+        return callBridge('forgetGrantedDevice', this.vendorId, this.productId, _frameToken()).then(function() {
             self.opened = false;
         });
     };
     OpenWebUSBDevice.prototype.transferIn = function(endpoint, length) {
-        return callBridge('bulkTransferIn', this._handle, endpoint, length).then(function(res) {
+        return callBridge('bulkTransferIn', this._handle, endpoint, length, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Transfer failed');
             // 🛡️ 実仕様(USBTransferStatus): STALLはrejectではなくstatus:'stall'を
             //    伴う成功resolveとして返る。Python側がstall検出時はres.statusに
@@ -347,7 +370,7 @@ WEBUSB_POLYFILL_JS = r"""
     };
     OpenWebUSBDevice.prototype.transferOut = function(endpoint, data) {
         var hex = bytesToHex(data);
-        return callBridge('bulkTransferOut', this._handle, endpoint, hex).then(function(res) {
+        return callBridge('bulkTransferOut', this._handle, endpoint, hex, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Transfer failed');
             return { status: res.status || 'ok', bytesWritten: res.bytesWritten };
         });
@@ -390,7 +413,7 @@ WEBUSB_POLYFILL_JS = r"""
             return Promise.reject(new DOMException(
                 'The specified endpoint is not an isochronous endpoint.', 'InvalidAccessError'));
         }
-        return callBridge('isochronousTransferIn', this._handle, endpointNumber, JSON.stringify(packetLengths))
+        return callBridge('isochronousTransferIn', this._handle, endpointNumber, JSON.stringify(packetLengths), _frameToken())
             .then(function(res) {
                 if (!res.success) throwFromResult(res, 'Isochronous transfer failed');
                 var totalLength = 0;
@@ -422,7 +445,7 @@ WEBUSB_POLYFILL_JS = r"""
                 'The specified endpoint is not an isochronous endpoint.', 'InvalidAccessError'));
         }
         var hex = bytesToHex(data);
-        return callBridge('isochronousTransferOut', this._handle, endpointNumber, hex, JSON.stringify(packetLengths))
+        return callBridge('isochronousTransferOut', this._handle, endpointNumber, hex, JSON.stringify(packetLengths), _frameToken())
             .then(function(res) {
                 if (!res.success) throwFromResult(res, 'Isochronous transfer failed');
                 return { packets: res.packets || [] };
@@ -432,7 +455,7 @@ WEBUSB_POLYFILL_JS = r"""
         var reqType = (setup.requestType === 'standard' ? 0x00 : setup.requestType === 'class' ? 0x20 : 0x40) |
                       (setup.recipient === 'interface' ? 0x01 : setup.recipient === 'endpoint' ? 0x02 : setup.recipient === 'other' ? 0x03 : 0x00) |
                       0x80; // Device-to-host
-        return callBridge('controlTransferIn', this._handle, reqType, setup.request, setup.value, setup.index, length).then(function(res) {
+        return callBridge('controlTransferIn', this._handle, reqType, setup.request, setup.value, setup.index, length, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Control transfer failed');
             var bytes = hexToUint8(res.data || '');
             return { status: res.status || 'ok', data: new DataView(bytes.buffer) };
@@ -442,7 +465,7 @@ WEBUSB_POLYFILL_JS = r"""
         var reqType = (setup.requestType === 'standard' ? 0x00 : setup.requestType === 'class' ? 0x20 : 0x40) |
                       (setup.recipient === 'interface' ? 0x01 : setup.recipient === 'endpoint' ? 0x02 : setup.recipient === 'other' ? 0x03 : 0x00);
         var hex = data ? bytesToHex(data) : '';
-        return callBridge('controlTransferOut', this._handle, reqType, setup.request, setup.value, setup.index, hex).then(function(res) {
+        return callBridge('controlTransferOut', this._handle, reqType, setup.request, setup.value, setup.index, hex, _frameToken()).then(function(res) {
             if (!res.success) throwFromResult(res, 'Control transfer failed');
             return { status: res.status || 'ok', bytesWritten: res.bytesWritten };
         });
@@ -482,7 +505,7 @@ WEBUSB_POLYFILL_JS = r"""
         onconnect: null,
         ondisconnect: null,
         getDevices: function() {
-            return callBridge('listDevices').then(function(res) {
+            return callBridge('listDevices', _frameToken()).then(function(res) {
                 return (res.devices || []).map(function(d) { return new OpenWebUSBDevice(d); });
             });
         },
@@ -519,7 +542,7 @@ WEBUSB_POLYFILL_JS = r"""
             return callBridge('requestDeviceChooser', JSON.stringify({
                 filters: _options.filters,
                 exclusionFilters: exclusionFilters,
-            })).then(function(res) {
+            }), _frameToken()).then(function(res) {
                 if (res.cancelled) {
                     // 🛡️ res.errorがある場合(再入防止ガード発火・pyusbバックエンド不通・
                     //    ダイアログ例外など)は実際の理由を伝える。無い場合(=ユーザーが

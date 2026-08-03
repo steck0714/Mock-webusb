@@ -35,6 +35,7 @@ from .errors import (
     not_found_error,
     security_error,
 )
+from .frame_origin import url_to_origin
 from .hardening import (
     UsbHotplugWatcher,
     build_device_descriptor,
@@ -109,6 +110,12 @@ class WebUSBBridge(QObject):
         #    (WebUSBBridgeインスタンスはページ単位なので、同一インスタンスへの
         #    再入だけを防げば十分)。
         self._chooser_active = False
+        # 🛡️ フレーム単位オリジン特定(frame_origin.FrameOriginTracker)。
+        #    install()がこのページを配線する際にセットする。未設定(None)の
+        #    ままなら、_current_origin()は従来どおりpage.url()だけを見る
+        #    後方互換パス(make_bridge()等でのテストや、install()を使わない
+        #    利用)を使う。
+        self._frame_tracker = None
         # 🛡️ ページが別オリジンへ遷移したら、開きっぱなしのUSBハンドルを即座に破棄する。
         #    (サイトAが開いたハンドル番号をサイトBが使い回して乗っ取る、を防ぐ)
         #    parentは実際にはこのブリッジを保持する QWebEnginePage。
@@ -143,7 +150,12 @@ class WebUSBBridge(QObject):
             connected, disconnected = self._hotplug_watcher.poll()
             if not connected and not disconnected:
                 return
-            origin = self._current_origin()
+            # 🛡️ deviceConnected/deviceDisconnectedはQt Signalとしてページ内の
+            #    全フレームへブロードキャストされる(Signal配信をフレーム単位に
+            #    絞る仕組みは無い)。フレームごとに異なる許可状況で出し分ける
+            #    ことは今のところできないため、トップレベルページの許可状況を
+            #    基準にする(frame_token経由の個別フレーム判定ではなく)。
+            origin = self._top_level_origin()
             if not origin:
                 return
             usb_core, usb_util = self._pyusb()
@@ -182,27 +194,29 @@ class WebUSBBridge(QObject):
 
     def _origin_from_url(self, qurl):
         """QUrlから 'scheme://host[:port]' 形式の正規化オリジン文字列を作る。
-        判定不能な場合はNone(=どのオリジンにも許可を出さない、安全側に倒す)。"""
-        try:
-            if qurl is None or not qurl.isValid():
-                return None
-            scheme = (qurl.scheme() or "").lower()
-            host = (qurl.host() or "").lower()
-            if not scheme or not host:
-                return None
-            default_ports = {"http": 80, "https": 443}
-            port = qurl.port(-1)
-            if port == -1 or port == default_ports.get(scheme):
-                return f"{scheme}://{host}"
-            return f"{scheme}://{host}:{port}"
-        except Exception as e:
-            print(f"[pyside6-webusb] _origin_from_url: 例外を無視: {e}")
-            return None
+        実体は frame_origin.url_to_origin() (このbridge.py側とFrameOriginTracker側とで
+        オリジン正規化ロジックが食い違わないよう、一箇所に集約してある)。"""
+        return url_to_origin(qurl)
 
-    def _current_origin(self):
-        """このブリッジを保持するページの「現在表示中」のオリジンを取得する。
+    def _current_origin(self, frame_token=""):
+        """呼び出し元フレームの「現在表示中」のオリジンを取得する。
         JSからの自己申告originを信用するのではなく、Qt/Python側で独立に確認することで、
-        ページ自身(=攻撃者が完全に制御できる側)による偽装を防ぐのが目的。"""
+        ページ自身(=攻撃者が完全に制御できる側)による偽装を防ぐのが目的。
+
+        🛡️ frame_tokenの扱いに関する重要な設計判断:
+        self._frame_tracker が配線されている(=install()経由の実運用でsetRunsOnSubFrames
+        が有効になっている)場合、メインフレームかどうかを問わず必ずトークン経由でしか
+        解決しない。「トークンが空/不明ならメインフレーム扱いにフォールバックする」という
+        判定は絶対に行わない -- それを許してしまうと、素のQWebChannelオブジェクトを直接
+        叩く敵対的なサブフレームが、トークンを渡さない(空文字のまま呼ぶ)だけで
+        トップレベルページに成りすませてしまい、0.0.2b0で修正した脆弱性がそのまま
+        復活してしまう。
+        self._frame_tracker が配線されていない場合(make_bridge()を使う既存の
+        単体テストや、install()を使わない後方互換の利用)は、従来どおり
+        page.url()を直接見る(この経路ではsetRunsOnSubFramesはFalseのままなので、
+        サブフレームからの呼び出しはそもそも構造的にあり得ない)。"""
+        if self._frame_tracker is not None:
+            return self._frame_tracker.origin_for_token(frame_token)
         page = self.parent()
         if page is None or not hasattr(page, "url"):
             return None
@@ -212,15 +226,32 @@ class WebUSBBridge(QObject):
             print(f"[pyside6-webusb] _current_origin: 例外を無視: {e}")
             return None
 
-    def _get_open_device(self, handle_id):
+    def _get_open_device(self, handle_id, frame_token=""):
         """ハンドルからusb.core.Deviceを取り出す。ハンドルを開いた本人(オリジン)と
         現在のオリジンが一致しない場合はNoneを返す(サイトを跨いだハンドル乗っ取り防止)。"""
         info = self._open_devices.get(handle_id)
         if info is None:
             return None
-        if info.get("origin") != self._current_origin():
+        if info.get("origin") != self._current_origin(frame_token):
             return None
         return info.get("device")
+
+    def _top_level_origin(self):
+        """トップレベルページ自身の「現在表示中」のオリジンを、フレームトークンとは
+        無関係に直接取得する(常にpage.url()を見る)。
+        _current_origin(frame_token) は「特定のフレームからの呼び出し」を検証する
+        ためのものだが、_on_page_navigated() のようにトップレベルページの
+        ナビゲーションそのものを検知したいだけの内部処理にはトークンという概念が
+        そぐわない(フレームトラッカー配線時、frame_token無しの_current_origin()は
+        意図的に常にNoneを返すため、代わりにこちらを使う必要がある)。"""
+        page = self.parent()
+        if page is None or not hasattr(page, "url"):
+            return None
+        try:
+            return self._origin_from_url(page.url())
+        except Exception as e:
+            print(f"[pyside6-webusb] _top_level_origin: 例外を無視: {e}")
+            return None
 
     def _on_page_navigated(self, *_args):
         """別オリジンへ遷移した瞬間、開いていたUSBハンドルを破棄する。
@@ -230,7 +261,7 @@ class WebUSBBridge(QObject):
         falsyなoriginへの許可を発行しないためinfo["origin"]がNoneになることは
         無いはずだが、比較ロジックだけに依存しない形にしておく)。"""
         try:
-            current = self._current_origin()
+            current = self._top_level_origin()
             if current is None:
                 stale_ids = list(self._open_devices.keys())
             else:
@@ -357,14 +388,17 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"available": False, "error": safe_error_str(e)})
 
-    @Slot(result=str)
-    def listDevices(self):
+    @Slot(str, result=str)
+    def listDevices(self, frame_token=""):
         """navigator.usb.getDevices() が呼ぶ。WebUSB本来の仕様どおり、
         「現在のオリジンがrequestDevice()で過去に許可したデバイス」だけを返す。
         旧実装は_is_granted()を一切参照せず接続中の全USBデバイスを無条件で返しており、
-        任意のサイトがダイアログ無しでベンダーID/製品名等を収集できてしまっていた。"""
+        任意のサイトがダイアログ無しでベンダーID/製品名等を収集できてしまっていた。
+        frame_token: フレーム単位オリジン特定用(frame_origin.FrameOriginTracker)。
+        install()経由の実運用では必須(空/不明なトークンは「オリジン不明」として
+        安全側に倒れ、devices:[]を返す)。"""
         try:
-            origin = self._current_origin()
+            origin = self._current_origin(frame_token)
             if not origin:
                 return json.dumps({"devices": []})
             usb_core, usb_util = self._pyusb()
@@ -454,8 +488,8 @@ class WebUSBBridge(QObject):
             print(f"[pyside6-webusb] _enumerate_filtered_devices: 例外を無視: {e}")  # 並べ替えに失敗しても一覧表示自体は継続する
         return devices_info
 
-    @Slot(str, result=str)
-    def requestDeviceChooser(self, options_json):
+    @Slot(str, str, result=str)
+    def requestDeviceChooser(self, options_json, frame_token=""):
         """navigator.usb.requestDevice() 相当。実処理は _request_device_chooser_impl()
         に委譲し、ここでは再入防止ガードだけを担う。
         🛡️ dlg.exec()(_request_device_chooser_impl内)はネストしたQtイベントループを
@@ -463,7 +497,8 @@ class WebUSBBridge(QObject):
         requestDeviceChooser()が呼ばれる(ページの連打や、QWebChannelメッセージが
         ネストループ中に処理される等)と、チューザーダイアログが二重に開いてしまう
         恐れがある。try/finallyで確実にフラグを解除することで、内部実装側の
-        どの return/例外経路を通っても再入状態が残留しないようにしている。"""
+        どの return/例外経路を通っても再入状態が残留しないようにしている。
+        frame_token: フレーム単位オリジン特定用。"""
         if self._chooser_active:
             return json.dumps({
                 "cancelled": True,
@@ -471,11 +506,11 @@ class WebUSBBridge(QObject):
             })
         self._chooser_active = True
         try:
-            return self._request_device_chooser_impl(options_json)
+            return self._request_device_chooser_impl(options_json, frame_token)
         finally:
             self._chooser_active = False
 
-    def _request_device_chooser_impl(self, options_json):
+    def _request_device_chooser_impl(self, options_json, frame_token=""):
         """navigator.usb.requestDevice() の実処理本体。実デバイス選択ダイアログを表示し、
         ユーザーが明示的に選んだ場合のみデバイス情報を返す（WebUSB本来のセキュリティ設計を踏襲）。
         ★ メソッド全体を try/except で包み、ダイアログ表示中の例外でアプリが落ちないようにしている。
@@ -490,6 +525,7 @@ class WebUSBBridge(QObject):
         ★ @Slotをあえて付けていない: QWebChannel/JSから直接叩けるのは
         requestDeviceChooser()(再入防止ガード込み)だけにするため。"""
         try:
+            origin = self._current_origin(frame_token)
             try:
                 options = json.loads(options_json) if options_json else {}
                 if not isinstance(options, dict):
@@ -530,7 +566,7 @@ class WebUSBBridge(QObject):
             try:
                 dlg = WebUsbDeviceChooserDialog(
                     devices_info, parent,
-                    origin=self._current_origin(),
+                    origin=origin,
                     refresh_callback=_refresh,
                 )
                 result = dlg.exec()
@@ -549,7 +585,7 @@ class WebUSBBridge(QObject):
                 # ユーザーがダイアログで明示的に選んだ場合のみ、このオリジンに対する
                 # 恒久的な許可を記録する(listDevices/openDeviceはこれを介してのみ許可を判定する)。
                 try:
-                    self._grant(self._current_origin(), selected.get("vendorId"), selected.get("productId"))
+                    self._grant(origin, selected.get("vendorId"), selected.get("productId"))
                 except Exception as e:
                     print(f"[pyside6-webusb] requestDeviceChooser: 例外を無視: {e}")
                 # 🛡️ チューザー一覧はパフォーマンスのため軽量記述子(configurations無し)で
@@ -572,13 +608,16 @@ class WebUSBBridge(QObject):
             # 最外殻の保険: ここまでの個別try/exceptで拾いきれない想定外の例外も必ず捕捉する
             return json.dumps({"cancelled": True, "error": f"Unexpected error: {e}"})
 
-    @Slot(int, int, result=str)
-    def openDevice(self, vendor_id, product_id):
+    @Slot(int, int, str, result=str)
+    def openDevice(self, vendor_id, product_id, frame_token=""):
         """requestDeviceChooser()で許可されたオリジンだけがデバイスを開けるようにする。
         旧実装はvendorId/productIdさえ知っていれば任意のサイトが直接開けてしまっていた
-        (チューザーダイアログを経由しないバイパス経路)。ここで許可をゲートする。"""
+        (チューザーダイアログを経由しないバイパス経路)。ここで許可をゲートする。
+        frame_token: フレーム単位オリジン特定用。ここで確定したオリジンが
+        _open_devices[handle_id]["origin"] として記録され、以降そのハンドルを使う
+        全ての操作(_get_open_device経由)の認証基準になる。"""
         try:
-            origin = self._current_origin()
+            origin = self._current_origin(frame_token)
             if not self._is_granted(origin, vendor_id, product_id):
                 return json.dumps({"success": False, "error": "Permission denied: this origin has not been granted access to this device"})
             if is_blocklisted_device(vendor_id, product_id):
@@ -594,11 +633,11 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    @Slot(int)
-    def closeDevice(self, handle_id):
+    @Slot(int, str)
+    def closeDevice(self, handle_id, frame_token=""):
         try:
             # 別オリジンのハンドルは「存在しない」ものとして扱う(_get_open_deviceがオリジン照合する)
-            if self._get_open_device(handle_id) is None:
+            if self._get_open_device(handle_id, frame_token) is None:
                 return
             info = self._open_devices.pop(handle_id, None)
             dev = info.get("device") if info else None
@@ -611,8 +650,8 @@ class WebUSBBridge(QObject):
         except Exception as e:
             print(f"[pyside6-webusb] closeDevice: 例外を無視: {e}")
 
-    @Slot(int, int, result=str)
-    def claimInterface(self, handle_id, interface_number):
+    @Slot(int, int, str, result=str)
+    def claimInterface(self, handle_id, interface_number, frame_token=""):
         """🛡️ WebUSB仕様が定める「保護対象インターフェースクラス」
         (Audio/HID/Mass Storage/Hub/Smart Card/Video/Audio-Video/Wireless Controller)は
         ここで一律拒否する。旧実装はインターフェースクラスを一切見ておらず、
@@ -626,7 +665,7 @@ class WebUSBBridge(QObject):
         失敗時にNoneを返し、is_protected_interface_class(None)がTrueになるため、
         機能的には拒否されていたが理由の表示が不正確だった)。"""
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             try:
@@ -662,15 +701,15 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    @Slot(int, int, result=str)
-    def releaseInterface(self, handle_id, interface_number):
+    @Slot(int, int, str, result=str)
+    def releaseInterface(self, handle_id, interface_number, frame_token=""):
         """旧実装はJS側のreleaseInterface()がno-op(Promise.resolve()するだけ)で
         Python側に一切届いておらず、一度claimしたインターフェースは
         デバイスを閉じるまで解放されなかった。
         🛡️ claimInterfaceと同様、実Chromeが要求するEnsureDeviceConfigured()相当の
         チェック(configurationが選択されていること)も行う。"""
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             try:
@@ -689,13 +728,13 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    @Slot(int, int, result=str)
-    def selectConfiguration(self, handle_id, configuration_value):
+    @Slot(int, int, str, result=str)
+    def selectConfiguration(self, handle_id, configuration_value, frame_token=""):
         """旧実装はJS側のselectConfiguration()がno-opで、複数コンフィグレーションを
         持つデバイスでは常に(pyusbが自動選択した)最初のコンフィグレーションしか
         使えなかった。"""
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             dev.set_configuration(configuration_value)
@@ -703,8 +742,8 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    @Slot(int, int, int, result=str)
-    def selectAlternateInterface(self, handle_id, interface_number, alternate_setting):
+    @Slot(int, int, int, str, result=str)
+    def selectAlternateInterface(self, handle_id, interface_number, alternate_setting, frame_token=""):
         """USBInterface.selectAlternateInterface() 相当。pyusbの
         Device.set_interface_altsetting()へ実配線する(調査の結果、pyusb 1.x系の
         公開APIとして存在することを確認済み)。旧実装はJS側で常にNotSupportedErrorを
@@ -720,7 +759,7 @@ class WebUSBBridge(QObject):
         (稀だが)想定していない。claimInterfaceの時点で拒否されていれば
         そもそもこのSlotへは到達しない。"""
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             info = self._open_devices.get(handle_id) or {}
@@ -735,11 +774,11 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    @Slot(int, result=str)
-    def resetDevice(self, handle_id):
+    @Slot(int, str, result=str)
+    def resetDevice(self, handle_id, frame_token=""):
         """USBDevice.reset() 相当。デバイスのUSBバスリセットを行う。"""
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             dev.reset()
@@ -835,12 +874,12 @@ class WebUSBBridge(QObject):
 
         return None, owner_number
 
-    @Slot(int, str, int, result=str)
-    def clearHalt(self, handle_id, direction, endpoint_number):
+    @Slot(int, str, int, str, result=str)
+    def clearHalt(self, handle_id, direction, endpoint_number, frame_token=""):
         """USBDevice.clearHalt(direction, endpointNumber) 相当。
         directionは 'in' または 'out'。"""
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             validation_error, _owner = self._endpoint_available_or_error(
@@ -855,8 +894,8 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    @Slot(int, int, int, result=str)
-    def bulkTransferIn(self, handle_id, endpoint, length):
+    @Slot(int, int, int, str, result=str)
+    def bulkTransferIn(self, handle_id, endpoint, length, frame_token=""):
         """USBDevice.transferIn(endpointNumber, length) 相当。
         🛡️ 実仕様: 'Let endpointAddress be endpointNumber | 0x80' — JSから渡ってくる
         endpointはIN/OUTの方向ビットを含まない生のendpointNumber(spec/JS両方の呼称)
@@ -866,7 +905,7 @@ class WebUSBBridge(QObject):
         旧実装はこの変換が丸ごと抜けており、endpoint=1のIN転送がbEndpointAddress=0x01
         (=同じ番号のOUT側)を叩きにいってしまい、実機相手には常に失敗していた。"""
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             validation_error, _owner = self._endpoint_available_or_error(handle_id, dev, True, endpoint)
@@ -887,10 +926,10 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    @Slot(int, int, str, result=str)
-    def bulkTransferOut(self, handle_id, endpoint, data_hex):
+    @Slot(int, int, str, str, result=str)
+    def bulkTransferOut(self, handle_id, endpoint, data_hex, frame_token=""):
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             validation_error, _owner = self._endpoint_available_or_error(handle_id, dev, False, endpoint)
@@ -1006,10 +1045,10 @@ class WebUSBBridge(QObject):
 
         return None
 
-    @Slot(int, int, int, int, int, int, result=str)
-    def controlTransferIn(self, handle_id, request_type, request, value, index, length):
+    @Slot(int, int, int, int, int, int, str, result=str)
+    def controlTransferIn(self, handle_id, request_type, request, value, index, length, frame_token=""):
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             validation_error = self._control_transfer_validation_error(handle_id, dev, request_type, request, index)
@@ -1025,10 +1064,10 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    @Slot(int, int, int, int, int, str, result=str)
-    def controlTransferOut(self, handle_id, request_type, request, value, index, data_hex):
+    @Slot(int, int, int, int, int, str, str, result=str)
+    def controlTransferOut(self, handle_id, request_type, request, value, index, data_hex, frame_token=""):
         try:
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             validation_error = self._control_transfer_validation_error(handle_id, dev, request_type, request, index)
@@ -1144,8 +1183,8 @@ class WebUSBBridge(QObject):
     #    ここから先(iso_read/iso_writeの実呼び出し)は自動テストでも実機相手には
     #    検証できていない。フォールバック経路(バックエンド非対応・packetLengths
     #    不正)とパケット分割の算術だけはテスト済み。実配線での検証は別途必要。
-    @Slot(int, int, str, result=str)
-    def isochronousTransferIn(self, handle_id, endpoint, packet_lengths_json):
+    @Slot(int, int, str, str, result=str)
+    def isochronousTransferIn(self, handle_id, endpoint, packet_lengths_json, frame_token=""):
         """USBDevice.isochronousTransferIn(endpointNumber, packetLengths) 相当。"""
         try:
             packet_lengths, error = self._validate_packet_lengths(packet_lengths_json)
@@ -1154,7 +1193,7 @@ class WebUSBBridge(QObject):
             packet_length = packet_lengths[0]
             total_length = packet_length * len(packet_lengths)
 
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             validation_error, _owner = self._endpoint_available_or_error(
@@ -1192,8 +1231,8 @@ class WebUSBBridge(QObject):
         except Exception as e:
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
-    @Slot(int, int, str, str, result=str)
-    def isochronousTransferOut(self, handle_id, endpoint, data_hex, packet_lengths_json):
+    @Slot(int, int, str, str, str, result=str)
+    def isochronousTransferOut(self, handle_id, endpoint, data_hex, packet_lengths_json, frame_token=""):
         """USBDevice.isochronousTransferOut(endpointNumber, data, packetLengths) 相当。"""
         try:
             packet_lengths, error = self._validate_packet_lengths(packet_lengths_json)
@@ -1201,7 +1240,7 @@ class WebUSBBridge(QObject):
                 return error
             packet_length = packet_lengths[0]
 
-            dev = self._get_open_device(handle_id)
+            dev = self._get_open_device(handle_id, frame_token)
             if dev is None:
                 return json.dumps({"success": False, "error": "Invalid device handle"})
             validation_error, _owner = self._endpoint_available_or_error(
@@ -1237,13 +1276,13 @@ class WebUSBBridge(QObject):
             return json.dumps({"success": False, "error": safe_error_str(e)})
 
     # --- オリジン権限の管理 ---
-    @Slot(int, int, result=str)
-    def forgetGrantedDevice(self, vendor_id, product_id):
+    @Slot(int, int, str, result=str)
+    def forgetGrantedDevice(self, vendor_id, product_id, frame_token=""):
         """USBDevice.forget() 相当。★あえて対象オリジンを引数に取らない:
         現在のページ自身(self._current_origin())の許可だけを取り消せるようにし、
         任意のサイトが他サイトの許可を操作できないようにしている。"""
         try:
-            origin = self._current_origin()
+            origin = self._current_origin(frame_token)
             if not origin:
                 return json.dumps({"success": False})
             data = self._load_granted_origins()

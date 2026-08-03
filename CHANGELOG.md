@@ -2,6 +2,97 @@
 
 All notable changes to this project are documented here.
 
+## [0.0.3b0]
+
+Implemented the per-frame origin attribution design that `0.0.3`/`0.0.3a0` researched but
+didn't ship. `navigator.usb` is available in iframes again (`setRunsOnSubFrames(True)`,
+reverting the `0.0.2b0` lockdown) — but now backed by a real per-frame origin check instead of
+the vulnerable page-wide one that made that lockdown necessary in the first place.
+
+### Added
+
+- **`frame_origin.py`** (new module) — `FrameOriginTracker`, which is what makes this safe to
+  re-enable. Design: Python (not JS) walks the real frame tree via
+  `QWebEnginePage.mainFrame()`/`QWebEngineFrame.children()`, mints an unguessable token
+  (`secrets.token_urlsafe`) per frame, and pushes it into *that specific frame* via
+  `QWebEngineFrame.runJavaScript()` — a different, cross-origin frame cannot read another
+  frame's token without breaking the same-origin policy itself. `WEBUSB_POLYFILL_JS` reads its
+  own `window.__pyUsbFrameToken` and sends it with every bridge call; `WebUSBBridge` resolves
+  the caller's real origin by looking the token up, never by trusting anything JS claims about
+  itself. Rescans are triggered by `QWebEnginePage.navigationRequested` (fires once per frame
+  navigation, including subframes — confirmed in `0.0.3a0`), staggered a few times after each
+  signal since the request arrives before the frame necessarily exists in the tree, plus a
+  2-second periodic rescan as a backstop.
+
+  Three things only showed up once this was tested against a **real** `QWebEnginePage` (not
+  the fakes the rest of the test suite uses), which is exactly why that testing mattered:
+    - `QWebEngineFrame.runJavaScript(code)` with a single argument raises *"not enough
+      arguments"* — it requires a callback as a second argument, even one that does nothing.
+    - `QWebEnginePage.setHtml(html, baseUrl=...)` does **not** make
+      `QWebEngineFrame.url()` reflect `baseUrl` — it reports the content as a `data:` URL
+      instead, which correctly (if confusingly, for testing) resolves to no origin at all.
+      Real navigations (`page.load(QUrl(...))`) behave as expected; the integration test uses
+      that instead.
+    - `QWebEngineFrame` Python objects returned by `children()`/`mainFrame()` don't appear to
+      be stable across calls — the same underlying iframe showed different `id()` values on
+      successive rescans. The original design tried to track "does this frame already have a
+      valid token" per frame identity to avoid re-issuing tokens; that check silently never
+      matched, defeating its own purpose (harmlessly — it just re-issued tokens more than
+      necessary). Removed that optimization rather than build something fragile on top of an
+      identity assumption that doesn't hold; every rescan simply (re-)issues a fresh token for
+      every frame it finds now, with a global cap (`_MAX_TOTAL_TOKENS`) on how many tokens are
+      kept at once so this can't grow without bound.
+
+- **`frame_token` parameter, threaded through every origin-sensitive `@Slot`** (`listDevices`,
+  `requestDeviceChooser`, `openDevice`, `closeDevice`, `claimInterface`, `releaseInterface`,
+  `selectConfiguration`, `selectAlternateInterface`, `resetDevice`, `clearHalt`,
+  `bulkTransferIn`/`Out`, `controlTransferIn`/`Out`, `isochronousTransferIn`/`Out`,
+  `forgetGrantedDevice` — 16 methods). Defaults to `""`, so every existing direct-Python test
+  call site kept working unchanged (`WebUSBBridge._current_origin(frame_token="")` falls back
+  to the pre-`0.0.3b0` `page.url()`-only behavior whenever `self._frame_tracker` is `None`,
+  which is exactly the case for tests built via `make_bridge()` or any other use of this
+  package without `install()`). `_get_open_device()` also takes `frame_token` now, since it's
+  the shared choke point roughly a dozen of those methods funnel through to authorize reuse of
+  an already-open handle — this is what makes the fix functionally complete rather than just
+  "fails closed but broken": a handle opened by a subframe now stays usable by that *same*
+  subframe for follow-up calls, not just at the moment it was opened.
+
+  **The one rule this all depends on:** when `self._frame_tracker` is not `None`,
+  `_current_origin()` resolves *exclusively* through the token — including for the main frame,
+  which also gets an assigned token now like any other frame. There is no "empty token falls
+  back to the top-level page" case once a tracker is wired, on purpose: allowing that would
+  let a hostile subframe calling the raw `QWebChannel` object directly (bypassing the polyfill
+  entirely) impersonate the top-level page just by omitting the token — reintroducing the exact
+  `0.0.2b0` vulnerability this whole feature exists to close.
+
+  Added a dedicated internal `_top_level_origin()` (always reads `page.url()` directly, no
+  token involved) for the two places that were never about "which frame is calling" in the
+  first place: `_on_page_navigated()` (detects the top-level page itself navigating, to drop
+  stale handles) and the hotplug watcher's `deviceConnected`/`deviceDisconnected` filtering
+  (these are `Signal`s broadcast to every frame on the page — there's no mechanism to target a
+  `Signal` at one specific frame, so per-frame-scoped hotplug notifications are out of scope
+  for now; they're filtered against the top-level page's grants, same as before).
+
+- **Tests**: `tests/test_frame_origin.py` — eight fast tests against fakes (token issuance,
+  nested-frame walking, opaque-URL rejection, the `is_functional` fallback, the total-token
+  cap, exception resilience) plus one real-`QWebEnginePage` integration test (loads local HTML
+  containing a cross-origin iframe, confirms the iframe gets a token that resolves to its own
+  real origin, and that an empty or forged token resolves to nothing). `tests/test_bridge.py`
+  gained two more: `test_frame_tracker_wired_denies_empty_and_forged_tokens` and
+  `test_frame_tracker_wired_isolates_handles_between_different_frame_origins`, exercising the
+  exact attack shape this feature closes without needing a real browser context for every run.
+
+### Fixed
+- `install()`'s two injected `QWebEngineScript`s now call `setRunsOnSubFrames(True)` again —
+  but only when `FrameOriginTracker.wire()` actually managed to connect to
+  `navigationRequested` (`tracker.is_functional`). On a PySide6/Qt version old enough not to
+  have that signal, `install()` falls back to the `0.0.2b0` behavior
+  (`setRunsOnSubFrames(False)`) automatically rather than silently running with no real
+  per-frame protection.
+
+### Project metadata
+- Version bumped to `0.0.3b0`.
+
 ## [0.0.3a0]
 
 Follow-up to `0.0.3`'s research question: does a per-frame navigation/load signal actually
