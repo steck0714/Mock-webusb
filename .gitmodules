@@ -1,0 +1,3 @@
+[submodule "pyside6-webusb"]
+	path = pyside6-webusb
+	url = https://github.com/steck0714/Pyside6-webusb.git
