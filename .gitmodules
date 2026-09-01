@@ -5,3 +5,4 @@
 [submodule "fox-webusb"]
 	path = fox-webusb
 	url = https://github.com/steck0714/fox-webusb.git
+
